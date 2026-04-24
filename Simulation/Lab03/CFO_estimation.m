@@ -1,0 +1,53 @@
+% % CFO_estimation.m
+% % Time-domain CP based method and Frequency-domain (Moose/Classen) methods
+% % 
+% 
+% % MIMO-OFDM Wireless Communications with MATLAB¢ç   Yong Soo Cho, Jaekwon Kim, Won Young Yang and Chung G. Kang
+% % 2010 John Wiley & Sons (Asia) Pte Ltd
+% 
+% % http://www.wiley.com//legacy/wileychi/cho/
+% 
+
+%CFO_estimation.m
+%Time-domain CP based method and Frequency-domain (Moose/Classen) method
+clear, clf
+CFO = 0.15;
+Nfft=128; % FFT size
+Nbps=2; M=2^Nbps; % Number of bits per (modulated) symbol
+% h = modem.qammod('M',M, 'SymbolOrder','gray');
+Es=1; A=sqrt(3/2/(M-1)*Es); % Signal energy and QAM normalization factor
+N=Nfft; Ng=Nfft/4; Nofdm=Nfft+Ng; Nsym=3;
+x=[]; % Transmit signal
+for m=1:Nsym
+msgint=randi([0,1],N,M);
+if i<=2, Xp= add_pilot(zeros(1,Nfft),Nfft,4); Xf=Xp; % add_pilot
+else Xf=qammod(msgint,M);    %Xf = A*modulate(h,msgint);
+end
+xt = ifft(Xf,Nfft); % IFFT
+x_sym = add_CP(xt,Ng); % add CP
+x = [x x_sym];
+end
+y=x; % No channel effect
+sig_pow= y*y'/length(y); % Signal power calculation
+SNRdBs= 0:3:30; MaxIter = 100;
+for i=1:length(SNRdBs)
+SNRdB = SNRdBs(i);
+MSE_CFO_CP = 0; MSE_CFO_Moose = 0; MSE_CFO_Classen = 0;
+rand('seed',1); randn('seed',1); % Initialize seed for random number
+y_CFO= add_CFO(y,CFO,Nfft); % Add CFO
+for iter=1:MaxIter
+y_aw = awgn(y_CFO,SNRdB,'measured'); % AWGN added
+CFO_est_CP = CFO_CP(y_aw,Nfft,Ng); % CP-based
+MSE_CFO_CP = MSE_CFO_CP + (CFO_est_CP-CFO)^2;
+CFO_est_Moose = CFO_Moose(y_aw,Nfft); % Moose
+MSE_CFO_Moose = MSE_CFO_Moose + (CFO_est_Moose-CFO)^2;
+CFO_est_Classen = CFO_Classen(y_aw,Nfft,Ng,Xp); % Classen
+MSE_CFO_Classen = MSE_CFO_Classen+(CFO_est_Classen-CFO)^2;
+end % End of (iter) loop
+MSE_CP(i)=MSE_CFO_CP/MaxIter; MSE_Moose(i)=MSE_CFO_Moose/MaxIter;
+MSE_Classen(i)=MSE_CFO_Classen/MaxIter;
+end % End of SNR loop
+semilogy(SNRdBs,MSE_CP,'-+'), grid on, hold on
+semilogy(SNRdBs,MSE_Moose,'-x'), semilogy(SNRdBs,MSE_Classen,'-*')
+xlabel('SNR[dB]'), ylabel('MSE'); title('CFO Estimation');
+legend('CP-based technique','Moose','Classen')

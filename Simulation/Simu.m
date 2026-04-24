@@ -1,0 +1,213 @@
+%% ============================================================
+% simulation_ofdm_complete_awgn.m
+% OFDM SISO complet en simulation MATLAB
+% TX -> préambule -> STO/CFO -> AWGN -> synchro -> correction CFO
+% -> FFT -> estimation canal -> égalisation -> démodulation -> BER
+%% ============================================================
+
+clear; clc; close all;
+
+%% 1) Configuration OFDM
+
+N_FFT   = 64;
+N_CP    = N_FFT/4;
+N_VC    = N_FFT/4;
+N_USED  = N_FFT - N_VC;
+N_SYM   = 12;
+M_ORDER = 16;
+
+Nbps = log2(M_ORDER);
+Nsym_total = N_FFT + N_CP;
+
+K = N_USED/2;
+data_bins_shift = [-K:-1 1:K];
+shiftIdx = data_bins_shift + N_FFT/2 + 1; %Pour suivre le indices MATLAB
+
+%% 2) Paramètres de simulation
+rng(1,'twister'); % Pour avoir toujours les même résultats
+
+EbN0dB = 15; %Choix aribitraire
+Fs = 2.5e6;
+
+STO_samples = 650;     % Décalage temporel arbitraire
+CFO_Hz = 5000;         % Décalage fréquentiel arbitraire
+
+%% 3) Génération des bits
+
+nbBits = N_USED * N_SYM * Nbps;
+txBits = randi([0 1], nbBits, 1);
+
+%% 4) Modulation (16-QAM pour nous)
+
+bitGroups = reshape(txBits, Nbps, []).';
+txInts = bi2de(bitGroups, 'left-msb');
+
+txQAM = qammod(txInts, M_ORDER,'gray', 'UnitAveragePower', true); %modulation avec quammod et le communication toolbox
+
+%% 5) Conversion
+
+txGridUsed = reshape(txQAM, N_USED, N_SYM); %Reshape pour imiter sous-porteuse: Colone = symbole, Ligne = sous-porteuse
+
+txGridShift = zeros(N_FFT, N_SYM);
+txGridShift(shiftIdx, :) = txGridUsed; %Crééer le signal avec les zéros
+
+%% 6) IFFT
+
+txGrid = ifftshift(txGridShift, 1); %Remet les indices en ordre pour Matlab pour la IFFT
+txTime = ifft(txGrid, N_FFT, 1); %iift pour transmettre la trame dans le temps
+
+%% 7) Insertion du CP
+
+txCP = txTime(end-N_CP+1:end, :);   %Création du CP
+txSymCP = [txCP; txTime];           %Ajout du CP
+txPayload = txSymCP(:);             %Création du Payload en une colonne
+
+%% 8) Préambule
+
+preambleFreqShift = zeros(N_FFT, 1);
+
+preamblePattern = ones(N_USED, 1);
+preamblePattern(2:2:end) = -1;      %Création du préambule en BPSK +1,-1,+1,-1 ...
+
+preambleFreqShift(shiftIdx) = preamblePattern;      %Shift sur les indice matlab
+preambleFreq = ifftshift(preambleFreqShift);        
+
+preambleTime = ifft(preambleFreq, N_FFT);           %Création dans le domaine du temps
+preambleCP = preambleTime(end-N_CP+1:end);
+preambleOne = [preambleCP; preambleTime];
+
+
+preamble = [preambleOne; preambleOne];              % Deux préambules identiques pour permettre l'estimation CFO
+
+txFrame = [preamble; txPayload];                    %Trame complète
+
+%% 9) Canal simulé : STO + CFO + AWGN
+
+% STO : ajout d'un délai temporel avant la trame pour imiter le STO
+txDelayed = [zeros(STO_samples,1); txFrame];
+
+% CFO : rotation de phase progressive
+n = (0:length(txDelayed)-1).';
+rxCFO = txDelayed .* exp(1j*2*pi*CFO_Hz*n/Fs);      %Via la formule: e^(j2?f??n/Fs?)
+
+% AWGN
+snr_dB = EbN0dB + 10*log10(Nbps * N_USED/N_FFT);    %Conversion du EbN0dB en SNR pour les symbole
+
+sigPow = mean(abs(rxCFO).^2);                       %Puissance moyenne du signal
+noisePow = sigPow / 10^(snr_dB/10);                 %SNR en linéaire
+
+noise = sqrt(noisePow/2)*(randn(size(rxCFO)) + 1j*randn(size(rxCFO)));      %Création du bruit (complexe)
+
+rxSignal = rxCFO + noise;                           %Signal final (Tx -> STO -> CFO -> Bruit -> RXfinal)
+
+%% 10) Détection de trame et synchronisation STO
+
+% Préparer le filtre 
+preamble_conj = conj(preamble);          % conjugué complexe
+preamble_matched = flipud(preamble_conj); % inversion temporelle
+
+% Appliquer la convolution
+corr_complex = conv(rxSignal, preamble_matched, 'valid');
+
+% Détection du pic
+corrMetric = abs(corr_complex);
+
+%Détection de l'indice de la valeur maximal
+[maxValue, startIndex] = max(corrMetric);
+
+fprintf('STO réel     = %d échantillons\n', STO_samples);
+fprintf('STO estimé   = %d échantillons\n', startIndex-1);
+
+rxFrame = rxSignal(startIndex:end); %Signal RX alligné (STO annulé)
+
+%% 11) Estimation et compensation CFO
+
+LongPreambule = length(preambleOne);
+
+r1 = rxFrame(1:LongPreambule);                      %Preambule #1
+r2 = rxFrame(LongPreambule+1:2*LongPreambule);      %Preambule #2
+
+phaseDiff = angle(sum(conj(r1).*r2));               %Rotation accumulé dû au CFO
+CFO_est_Hz = phaseDiff/(2*pi*LongPreambule/Fs);     %Estimation du CFO
+
+fprintf('CFO réel     = %.2f Hz\n', CFO_Hz);
+fprintf('CFO estimé   = %.2f Hz\n', CFO_est_Hz);
+
+n2 = (0:length(rxFrame)-1).';
+rxFrameCFOcorr = rxFrame .* exp(-1j*2*pi*CFO_est_Hz*n2/Fs); %Correction du CFO
+
+%% 12) Retrait du préambule
+
+payloadStart = length(preamble) + 1;
+payloadEnd = payloadStart + length(txPayload) - 1;
+
+rxPayload = rxFrameCFOcorr(payloadStart:payloadEnd);
+
+%% 13) Récepteur OFDM : retrait CP + FFT
+
+rxSymCP = reshape(rxPayload, Nsym_total, N_SYM);    %Reshape en matrice
+
+rxSym = rxSymCP(N_CP+1:end, :);                     %Enlève le CP
+
+rxFFT = fft(rxSym, N_FFT, 1);                       %Retour en freq
+
+rxFFTShift = fftshift(rxFFT, 1);                    %Remet en indice freq et non matlab
+
+rxUsed = rxFFTShift(shiftIdx, :);                   %Extraire seulement les sous-porteuse utile
+
+%% 14) Estimation du canal
+
+H_estimation = mean(rxUsed(:) ./ txGridUsed(:));        %H[k] ? Y[k]/X[k]
+
+fprintf('Canal estimé H = %.4f %+.4fj\n', real(H_estimation), imag(H_estimation));
+
+%% 15) Égalisation
+
+rxEq = rxUsed ./ H_estimation;  %Annule le canal
+
+rxQAM = rxEq(:);                %Met le signal en vecteur simple
+
+%% 16) Affichage des constellations
+
+figure;
+
+subplot(1,2,1);
+plot(real(txQAM), imag(txQAM), '.');
+grid on;
+axis([-1.5 1.5 -1.5 1.5]);
+xlabel('I');
+ylabel('Q');
+title('Constellation TX');
+
+subplot(1,2,2);
+plot(real(rxQAM), imag(rxQAM), '.');
+grid on;
+axis([-1.5 1.5 -1.5 1.5]);
+xlabel('I');
+ylabel('Q');
+title('Constellation RX égalisée');
+
+
+%% 17) Détection + calcul BER
+
+rxInts = qamdemod(rxQAM, M_ORDER,'gray', 'UnitAveragePower', true); %Démodulation avec quamdemod (communicaiton toolbox)
+
+rxBitGroups = de2bi(rxInts, Nbps, 'left-msb');
+rxBits = reshape(rxBitGroups.', [], 1);
+
+bitErrors = sum(rxBits ~= txBits);
+BER = bitErrors / nbBits;
+
+fprintf('\n===== Résultats =====\n');
+fprintf('Eb/N0 = %d dB\n', EbN0dB);
+fprintf('Erreurs = %d / %d bits\n', bitErrors, nbBits);
+fprintf('BER = %.3e\n', BER);
+
+%% 18) Affichage métrique de corrélation du préambule
+
+figure;
+plot(corrMetric);
+grid on;
+xlabel('Indice échantillon');
+ylabel('|Corrélation|');
+title('Détection de trame par corrélation avec le préambule');
