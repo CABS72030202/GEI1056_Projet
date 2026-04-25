@@ -10,11 +10,18 @@ function rxContext = module_rx(rawSamples, config, txContext) %#ok<INUSD>
 
 	% 1) Recuperer les echantillons bruts deja recus par module_ofdm.
 	rxContext.rawSamples = normalize_rx_samples(rawSamples, config);
-	rxContext.displaySamples = rxContext.rawSamples;
 	rxContext.signalMetrics = analyze_rx_signal(rxContext.displaySamples);
 
-	% 2) Affichage de diagnostic RX (identique au style TX).
-	visualize_rx_signal(rxContext.displaySamples, config);
+
+    
+    %3) Détection du préambule (STO estimation and correction)
+    rxContext.sync = detect_preamble_sto(rxContext.rawSamples,txContext.preamble); %Détection de l'indice de début du preambule
+    rxContext.alignedFrame = rxContext.rawSamples(rxContext.sync.startIndex:end);   %Correction et allignement avec le preambule
+    
+    % 2) Affichage de diagnostic RX (identique au style TX).
+	visualize_rx_signal(rxContext.alignedFrame, config);
+    
+    
 end
 
 
@@ -112,8 +119,7 @@ function visualize_rx_signal(rxBuffer, config)
 	ax_const = nexttile(tl, [2 1]); %#ok<NASGU>
 	const_start = max(1, burst_center);
 	const_end   = min(n_total, const_start + 2999);
-	scatter(real(rxBuffer(const_start:const_end)), imag(rxBuffer(const_start:const_end)), 10, 'filled', ...
-		'MarkerFaceAlpha', 0.35);
+	scatter(real(rxBuffer(const_start:const_end)), imag(rxBuffer(const_start:const_end)), 10, 'filled','MarkerFaceAlpha', 0.35);
 	title('Constellation RX');
 	grid on;
 	axis equal;
@@ -124,3 +130,52 @@ function visualize_rx_signal(rxBuffer, config)
 
 	fprintf('module_rx: visualisation RX affichee (%d echantillons autour du burst).\n', plot_end - plot_start + 1);
 end
+
+
+function syncContext = detect_preamble_sto(rxSamples, preamble)
+% Detecter le debut de trame par correlation avec le preambule TX connu.
+% Le maximum de correlation donne l'estimation du STO.
+
+    syncContext = struct();
+    syncContext.startIndex = 1;
+    syncContext.estimatedSTO = 0;
+    syncContext.corrMetric = [];
+    syncContext.peakValue = 0;
+
+    if isempty(rxSamples) || isempty(preamble)
+        warning('module_rx:sync', 'Impossible de detecter le preambule: rxSamples ou preambule vide.');
+        return;
+    end
+
+    rxSamples = double(rxSamples(:));
+    preamble  = double(preamble(:));
+
+    if numel(rxSamples) < numel(preamble)
+        warning('module_rx:sync','Capture RX plus courte que le preambule: detection impossible.');
+        return;
+    end
+
+    % 1) Construire le filtre adapte du preambule
+    preambleConj = conj(preamble);
+    preambleMatched = flipud(preambleConj);
+
+    % 2) Correlation glissante
+    corrComplex = conv(rxSamples, preambleMatched, 'valid');
+
+    % 3) Magnitude de correlation
+    corrMetric = abs(corrComplex);
+
+    % 4) Trouver le pic de correlation
+    [peakValue, startIndex] = max(corrMetric);
+
+    % 5) Sauvegarde des resultats
+    syncContext.startIndex = startIndex;
+    syncContext.estimatedSTO = startIndex - 1;
+    syncContext.corrMetric = corrMetric;
+    syncContext.peakValue = peakValue;
+
+    fprintf('module_rx: preambule detecte a l''echantillon %d.\n', startIndex);
+    fprintf('module_rx: STO estime = %d echantillons.\n', syncContext.estimatedSTO);
+    fprintf('module_rx: pic de correlation = %.4e.\n', peakValue);
+end
+

@@ -61,8 +61,7 @@ function symbols = map_bits_to_symbols(bits, config)
 
 	% Bits -> indices entiers -> symboles QAM normalises.
 	symbol_indices = bi2de(b_reshaped, 'left-msb');
-	symbols = qammod(symbol_indices, config.M_ORDER, 'gray', ...
-		'InputType', 'integer', 'UnitAveragePower', true);
+	symbols = qammod(symbol_indices, config.M_ORDER, 'gray','InputType', 'integer', 'UnitAveragePower', true);
 
 	fprintf('module_tx: [%d x %d] symbols generes.\n', size(symbols, 1), size(symbols, 2));
 end
