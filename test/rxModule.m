@@ -1,5 +1,6 @@
-% OFDM YOHAN test lab 04
-clear; clc; close all;
+%% OFDM TRANSMISSION - BLADE RF
+%% RX MODULE 
+
 
 %% Preparation de l'environnement
 config = default_ofdm_config();
@@ -7,7 +8,8 @@ addpath(config.bladeRFMatlabDir);
 if ~contains(lower(getenv('PATH')), lower(config.bladeRFRoot))
     setenv('PATH', [config.bladeRFRoot ';' getenv('PATH')]);
 end
-rng(1,'twister');
+
+rng(1,'twister'); %Randomness seed
 
 %% Ouverture du bladeRF
 b = bladeRF();
@@ -15,11 +17,10 @@ fprintf('bladeRF ouvert avec succes.\n');
 fprintf('  Serial : %s\n', strtrim(b.info.serial));
 
 
+
 %% ============================================================
-% Chaine TX OFDM
-% bits -> QAM -> grille OFDM -> IFFT -> CP -> preambule -> txBuffer
+%  Configuration
 %% ============================================================
-% 1) Configuration
 N_FFT   = 64;
 N_CP    = N_FFT/4;
 N_VC    = N_FFT/4;
@@ -31,50 +32,32 @@ centerFrequencyHz = 2.45e9;
 bandwidthHz = 2.5e6;
 txGainDb = 40;
 rxGainDb = 40;
-streamTimeoutMs = 5000;
+streamTimeoutMs = 5000
 
 b = configure_bladerf(b, sampleRateHz, centerFrequencyHz, bandwidthHz, txGainDb, rxGainDb, streamTimeoutMs);
-
 K = N_USED/2;
 data_bins_shift = [-K:-1 1:K];
-
 % Indices MATLAB des sous-porteuses utilisees
 used_bins = mod(data_bins_shift, N_FFT) + 1;
 
-
-% 2) Generation des bits
+% 2) Generation des bits (SERA UTILISÉ SEULEMENT POUR LE BER)
 bits_per_sym = log2(M_ORDER);
 n_data_symbols = N_USED * N_SYM;
 total_bits = n_data_symbols * bits_per_sym;
 txBits = randi([0 1], total_bits, 1);
-
-
 % 3) Modulation QAM
 bitGroups = reshape(txBits, bits_per_sym, []).';
 symbol_indices = bi2de(bitGroups, 'left-msb');
 txSymbols = qammod(symbol_indices, M_ORDER,'gray', 'InputType', 'integer', 'UnitAveragePower', true);
-
-
-% 4) Conversion serie-parallele
+% 4) Conversion serie-parallele (SERA UTILISÉ SEULEMENT POUR LE BER)
 parallelSymbols = reshape(txSymbols, N_USED, N_SYM);
 frequencyGridShift = complex(zeros(N_FFT, N_SYM));
 frequencyGridShift(used_bins, :) = parallelSymbols;
 
 
-% 5) IFFT : domaine frequentiel -> domaine temporel
-X_ifft_in = ifftshift(frequencyGridShift, 1);
-x_time = ifft(X_ifft_in, N_FFT, 1);
-
-
-% 6) Ajout du CP
-x_cp = [x_time(end-N_CP+1:end, :); x_time];
-payload = x_cp(:);
-
-
-% 7) Construction du preambule
+% PREAMBULE IDENTIQUE SUR RX/TX
 N_PREA  = 8;  %Répétition du preambule
 preamble = [];
-
 preamble_freq_shift = complex(zeros(N_FFT, 1));
 alt = (-1).^(0:numel(used_bins)-1).';
 preamble_freq_shift(used_bins) = complex(alt, 0);
@@ -87,81 +70,44 @@ for k = 1:N_PREA
     preamble = [preamble; preamble_sym * sign_pattern(k)];
 end 
 
-% 8) Zero padding
-pad = complex(zeros(round(0.005 * sampleRateHz), 1)); % 5 ms de silence
-
-% 9) Création du signal
-%N_REP = 20; %répition du signal pour faire comme lab04
-timeSignal = [preamble; payload]; 
-txFrame = [pad; timeSignal; pad];
-
-
-% 10) Normalisation du buffer TX ET PEAK LIMITING (PAPR)
-peak_abs = max(abs(txFrame));
-if peak_abs <= 0
-    txBuffer = complex(single(txFrame));
-else
-    scale = 0.8 / peak_abs;
-    txBuffer = complex(single(txFrame * scale));
-end
-
 
 %% ============================================================
-% TRANSMISSION + CAPTURE BLADE RF
+%  CAPTURE BLADE RF
 %% ============================================================
-tx_len = numel(txBuffer);
-preroll  = round(config.rxPrerollMs  * sampleRateHz / 1000);
-postroll = round(config.rxPostrollMs * sampleRateHz / 1000);
-rx_len = tx_len + preroll + postroll;
 
-% Demarrer les modules TX/RX
+% Capture
+captureTimeSec = 1;   
+rx_len = round(captureTimeSec * sampleRateHz);
+
+fprintf('\nRX: capture de %d echantillons (%.3f ms)\n', rx_len, captureTimeSec);
+
+% Acquisition des données
 b.rx.start();
-b.tx.start();
-
-% Planifier TX dans le futur
-current_ts = double(b.rx.timestamp);
-tx_ts = uint64(current_ts + round(config.syncLeadTimeMs * sampleRateHz / 1000));
-
-% Planifier RX avant TX
-rx_ts = uint64(double(tx_ts) - preroll);
-
-% Envoyer le burst avec timestamp
-b.transmit(double(txBuffer(:)), streamTimeoutMs, tx_ts, true, true);
-
-% Capturer autour du burst
-[rawSamples, ts_out, actual_count, overrun] = b.receive(rx_len, streamTimeoutMs, rx_ts);
+[rawSamples, ts_out, actual_count, overrun] = b.receive(rx_len, streamTimeoutMs);
+b.rx.stop();
 
 rawSamples = rawSamples(:);
 
-if actual_count > 0 && actual_count < numel(rawSamples)
-    rawSamples = rawSamples(1:actual_count);
-end
+fprintf('RX: %d echantillons captures.\n', numel(rawSamples));
+fprintf('RX: timestamp retourne = %u.\n', ts_out);
 
 if overrun
-    warning('BladeRF: overrun detecte pendant la capture RX.');
+    warning('RX: overrun detecte pendant la capture.');
 end
-
-% Arret propre des modules
-b.rx.stop();
-b.tx.stop();
-
-
-%% ============================================================
-% RX OFDM LINEAIRE
-% Reception diagnostic
-%% ============================================================
-% 1) Recuperer les echantillons bruts
-rawSamples = rawSamples(:);
 
 if isempty(rawSamples)
     rawSamples = complex(zeros(N_FFT + N_CP, 1));
-    fprintf('RX: echantillons absents, buffer de secours cree (%d echantillons).\n', ...
-        numel(rawSamples));
+    fprintf('RX: echantillons absents, buffer de secours cree (%d echantillons).\n',numel(rawSamples));
 end
 rxSamples = rawSamples;
 
 
-%% SYNCHRONISATION ET STO
+
+
+%% ============================================================
+%  Synchronisation et STO
+%% ============================================================
+
 % 1) Detection du preambule par correlation
 if isempty(preamble)
     error('RX: preambule vide. Impossible de faire la detection STO.');
@@ -178,7 +124,7 @@ end
 preambleConj = conj(preambleDouble);
 preambleMatched = flipud(preambleConj);
 
-% Correlation glissante
+% Correlation glissante(convolution)
 corrComplex = conv(rxSamplesDouble, preambleMatched, 'valid');
 
 % Magnitude de correlation
@@ -195,7 +141,7 @@ alignedFrame = rxSamples(startIndex:end);
 % 5) Extraction propre des données
 Lpre = length(preamble);
 payload_start = startIndex + Lpre;
-payload_end   = payload_start + length(payload) - 1;
+payload_end   = payload_start + payload_len_expected - 1;
 if payload_end > length(rxSamples)
     error('Pas assez d''echantillons apres synchro');
 end
@@ -203,7 +149,10 @@ rxPreamble = rxSamples(startIndex : startIndex + Lpre - 1);
 rxPayload  = rxSamples(payload_start : payload_end);
 
 
-%% CFO
+%% ============================================================
+%  CFO
+%% ============================================================
+
 sym_len = N_FFT + N_CP;
 payload_len_expected = N_SYM * sym_len;
 rxPayload_forCFO = rxPayload(1:payload_len_expected);
@@ -228,27 +177,10 @@ n_cfopayload  = (0:length(rxPayload)-1).';
 rxPreambleCFO = rxPreamble.* exp(-1j*2*pi*eps_hat*n_cfopreamble);
 rxPayloadCFO  = rxPayload .* exp(-1j*2*pi*eps_hat*n_cfopayload);
 
-%% RESYNCHRONISATION APRES CFO
 
-rxSamplesCFOcorr = rxSamples .* exp(-1j*2*pi*eps_hat*(0:length(rxSamples)-1).');
-
-rxSamplesDouble_CFO = double(rxSamplesCFOcorr(:));
-
-corrComplex_CFO = conv(rxSamplesDouble_CFO, preambleMatched, 'valid');
-corrMetric_CFO = abs(corrComplex_CFO);
-
-[~, startIndex_CFO] = max(corrMetric_CFO);
-
-fprintf('RX: nouvelle synchro apres CFO = %d\n', startIndex_CFO);
-
-alignedFrameCFO = rxSamplesCFOcorr(startIndex_CFO:end);
-
-% Ré-extraction propre
-rxPreambleCFO = alignedFrameCFO(1:Lpre);
-rxPayloadCFO  = alignedFrameCFO(Lpre+1 : Lpre+length(payload));
-
-
-%% Estimation du canal avec preambule
+%% ============================================================
+%  Estimation du canal
+%% ============================================================
 % Reformer les repetitions du preambule
 rxPreBlk = reshape(rxPreambleCFO, sym_len, N_PREA);
 
@@ -371,18 +303,15 @@ disp(round(theta_hat, 3));
 rxQAM = rxEqCPE(:);
 
 
-
 %% ============================================================
 % DÉMODULATION
 %% ============================================================
+rxInts = qamdemod(rxQAM, M_ORDER,'gray','OutputType', 'integer','UnitAveragePower', true);
 
-
-rxInts = qamdemod(rxQAM, M_ORDER,'gray','OutputType', 'integer', 'UnitAveragePower', true);
-
-%% Conversion entiers -> bits
-
+%Conversion entiers -> bits
 rxBitGroups = de2bi(rxInts, bits_per_sym, 'left-msb');
 rxBits = reshape(rxBitGroups.', [], 1);
+
 
 %% ============================================================
 % CALCUL DU BER
@@ -396,25 +325,15 @@ fprintf('Bits transmis = %d\n', total_bits);
 fprintf('Erreurs bits  = %d\n', bitErrors);
 fprintf('BER           = %.3e\n', BER);
 
-%% Affichage constellation avant/apres egalisation
 
-figure('Name', 'Constellation RX avant/apres egalisation', ...
-       'NumberTitle', 'off');
 
-subplot(1,2,1);
-scatter(real(Y_used(:)), imag(Y_used(:)), 10, 'filled', ...
-    'MarkerFaceAlpha', 0.35);
-grid on;
-axis equal;
-xlabel('I');
-ylabel('Q');
-title('Avant egalisation');
-xlim([-3 3]);
-ylim([-3 3]);
+%% ============================================================
+% AFFICHAGE
+%% ============================================================
 
-subplot(1,2,2);
-scatter(real(rxQAM), imag(rxQAM), 10, 'filled', ...
-    'MarkerFaceAlpha', 0.35);
+%IQ
+figure(1);
+scatter(real(rxQAM), imag(rxQAM), 10, 'filled','MarkerFaceAlpha', 0.35);
 grid on;
 axis equal;
 xlabel('I');
@@ -423,8 +342,8 @@ title('Apres egalisation');
 xlim([-1.5 1.5]);
 ylim([-1.5 1.5]);
 
-%% Affichage du canal estime
 
+% Canal 
 figure('Name', 'Canal estime H[k]', 'NumberTitle', 'off');
 
 subplot(2,1,1);
@@ -440,6 +359,13 @@ grid on;
 xlabel('Indice sous-porteuse utile');
 ylabel('Phase H[k] (rad)');
 title('Phase du canal estime');
+
+
+
+
+
+
+
 
 
 
