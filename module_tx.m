@@ -1,10 +1,13 @@
 function txContext = module_tx(config)
-%MODULE_TX Structure de la chaine d'emission OFDM.
-% Chaque etape est isolee pour faciliter la lecture et les tests.
+%MODULE_TX Chaine d'emission OFDM complete.
+% Construit la trame a transmettre a partir de la configuration et retourne
+% une structure txContext contenant tous les signaux et parametres intermediaires.
 % Pipeline TX:
-% bits -> symboles QAM -> grille OFDM -> IFFT + CP -> preambule -> buffer radio
+% bits aleatoires -> symboles QAM -> grille OFDM -> IFFT + prefixe cyclique
+%                -> preambule -> zero padding -> normalisation -> buffer radio
 
-	% Conserver les informations utiles pour le suivi de la trame TX.
+	% Initialiser la structure de contexte TX avec des champs vides.
+	% Cette structure sera completee au fil des etapes du pipeline.
 	txContext = struct();
 	txContext.config = config;
 	txContext.bits = [];
@@ -16,30 +19,31 @@ function txContext = module_tx(config)
 	txContext.timeSignal = [];
 	txContext.txBuffer = [];
 
-	% 1) Generer les bits a transmettre.
+	% 1) Generer les bits d'information a transmettre.
 	txContext.bits = generate_tx_bits(config);
 
-	% 2) Mapper les bits vers la constellation choisie.
+	% 2) Mapper les bits vers les symboles de la constellation QAM choisie.
 	txContext.symbols = map_bits_to_symbols(txContext.bits, config);
 
-	% 3) Construire le payload OFDM et le preambule.
+	% 3) Construire la grille frequentielle OFDM et configurer le zero padding.
 	txContext = build_ofdm_frame(txContext, config);
     txContext.preamble = build_tx_preamble(config);
 
-	% 4) Passer en domaine temporel.
+	% 4) Convertir la grille OFDM en signal temporel (IFFT + prefixe cyclique).
 	txContext.timeSignal = compose_time_domain_signal(txContext, config);
 
-	% 5) Mettre le signal au format attendu par le bladeRF.
+	% 5) Normaliser le signal et le convertir au format attendu par la radio.
 	txContext.txBuffer = prepare_tx_buffer(txContext.timeSignal, config);
 
-	% 6) Visualiser le signal prepare + constellation.
+	% 6) Afficher le signal genere et la constellation TX.
 	visualize_tx_signal(txContext.txBuffer, txContext.symbols, config);
 end
 
 
 function bits = generate_tx_bits(config)
-% Generer une sequence de bits aleatoires pour la transmission.
-% Sortie: vecteur colonne de bits (0/1).
+% Generer une sequence de bits aleatoires uniformes a transmettre.
+% Le nombre de bits est calcule pour remplir exactement la grille OFDM:
+% N_USED sous-porteuses * N_SYM symboles * log2(M_ORDER) bits par symbole.
 
     bits_per_sym = log2(config.M_ORDER);
     n_data_symbols = config.N_USED * config.N_SYM;
@@ -60,7 +64,7 @@ function symbols = map_bits_to_symbols(bits, config)
 	% Regrouper les bits par symbole: [bits_per_sym] bits -> 1 symbole.
 	b_reshaped = reshape(bits, bits_per_sym, []).';
 
-	% Bits -> indices entiers -> symboles QAM normalises.
+	% Convertir les indices entiers en symboles QAM complexes normalises.
 	symbol_indices = bi2de(b_reshaped, 'left-msb');
 	symbols = qammod(symbol_indices, config.M_ORDER, 'gray','InputType', 'integer', 'UnitAveragePower', true);
 
@@ -69,19 +73,21 @@ end
 
 
 function txContext = build_ofdm_frame(txContext, config)
-% Construire la grille OFDM en domaine frequentiel.
-% Serie -> parallele: colonnes = symboles OFDM, lignes = sous-porteuses.
+% Construire la grille OFDM en domaine frequentiel (apres fftshift).
+% La conversion serie -> parallele repartit les symboles sur les colonnes
+% (une colonne = un symbole OFDM, une ligne = une sous-porteuse).
+% Les sous-porteuses de garde restent a zero (N_VC sous-porteuses inutilisees).
 
 	txContext.parallelSymbols = reshape(txContext.symbols, config.N_USED, config.N_SYM);
 
 	freq_grid_shift = complex(zeros(config.N_FFT, config.N_SYM));
 	used_bins = mod(config.data_bins_shift, config.N_FFT) + 1;
-	% Seules les sous-porteuses utilisees portent des donnees.
+	% Seules les sous-porteuses actives portent des donnees; les autres restent nulles.
 	freq_grid_shift(used_bins, :) = txContext.parallelSymbols;
 
 	txContext.frequencyGridShift = freq_grid_shift;
 
-	% Zero padding avant/apres trame
+	% Zero padding: silence avant et apres la trame pour faciliter la synchronisation RX.
 	pad_len = round((double(config.txZeroPadMs) / 1000) * double(config.sampleRateHz));
 	txContext.zeroPad = complex(zeros(pad_len, 1));
 
@@ -93,8 +99,11 @@ end
 
 
 function timeSignal = compose_time_domain_signal(txContext, config)
-% Appliquer IFFT, insertion CP, puis inserer un preambule en tete de trame.
-% CP (Cyclic Prefix): reduit l'impact du multi-trajet.
+% Convertir la grille OFDM frequentielle en signal temporel.
+% Etapes: ifftshift pour recentrer le spectre, IFFT colonne par colonne,
+% insertion du prefixe cyclique (CP) qui copie les N_CP derniers echantillons
+% en tete de chaque symbole pour absorber l'effet du multitrajet,
+% puis assemblage: zero padding | preambule | payload | zero padding.
 
 	X_ifft_in = ifftshift(txContext.frequencyGridShift, 1);
 	x_time = ifft(X_ifft_in, config.N_FFT, 1);
@@ -111,8 +120,9 @@ end
 
 
 function txBuffer = prepare_tx_buffer(timeSignal, ~)
-% Normaliser le signal pour limiter les saturations TX.
-% Le facteur 0.8 garde une marge anti-ecretage.
+% Normaliser le signal temporel pour eviter la saturation de l'amplificateur TX.
+% Le facteur 0.8 conserve une marge de 20% sous le plein echelle,
+% ce qui reduit le risque d'ecrerage sans trop reduire la puissance utile.
 
 	if isempty(timeSignal)
 		error('Signal temporel vide: impossible de preparer le buffer TX.');
@@ -131,10 +141,15 @@ function txBuffer = prepare_tx_buffer(timeSignal, ~)
 end
 
 function preamble = build_tx_preamble(config)
-% Preambule OFDM: repetitions du meme symbole avec pattern +/- alterne.
-% Sert de reference connue pour la synchronisation et l'estimation de canal.
+% Generer le preambule OFDM place en tete de chaque trame.
+% Le preambule est constitue de N_PREA repetitions d'un meme symbole OFDM,
+% avec un pattern de signe +/- alternant entre chaque repetition.
+% Les sous-porteuses actives sont modulees en BPSK avec un motif alterne (+1/-1),
+% ce qui produit un signal periodique facilement identifiable en reception.
+% Ce preambule sert a la fois a la synchronisation temporelle (STO)
+% et a l'estimation de la reponse du canal (H[k]).
 
-	% Generer le preambule de base: BPSK +/- alterne sur les porteuses utilisees
+	% Generer le symbole de base du preambule: BPSK alterne sur les sous-porteuses actives.
 	preamble_freq_shift = complex(zeros(config.N_FFT, 1));
 	used_bins = mod(config.data_bins_shift, config.N_FFT) + 1;
 	
@@ -146,7 +161,7 @@ function preamble = build_tx_preamble(config)
 	preamble_time = ifft(ifftshift(preamble_freq_shift, 1), config.N_FFT, 1);
 	preamble_sym = [preamble_time(end - config.N_CP + 1:end); preamble_time];
 
-	% Repetitions avec alternance de signe pour un motif plus robuste.
+	% Pattern d'alternance: +1 pour les repetitions impaires, -1 pour les paires.
 	sign_pattern = repmat([1, -1], 1, ceil(config.N_PREA / 2));
 	sign_pattern = sign_pattern(1:config.N_PREA);
 	preamble = [];
@@ -157,8 +172,9 @@ end
 
 
 function visualize_tx_signal(txBuffer, symbols, config)
-% Visualisation simple du signal TX (I/Q + module + constellation).
-% Outil de diagnostic visuel rapide.
+% Afficher le signal TX genere: composantes I/Q, enveloppe et constellation.
+% La fenetre d'affichage exclut les zones de zero padding pour ne montrer
+% que la partie utile contenant le preambule et le payload.
 
 	if isempty(txBuffer)
 		warning('module_tx: aucun echantillon TX a visualiser.');
@@ -171,7 +187,7 @@ function visualize_tx_signal(txBuffer, symbols, config)
 		fs = 1;
 	end
 
-	% Fenetre utile (entre les deux zero-padding)
+	% Calculer les indices de la fenetre utile (entre les deux zones de zero padding).
 	pad_len = round((double(config.txZeroPadMs) / 1000) * fs);
 	sym_len = double(config.N_FFT + config.N_CP);
 	useful_len = double(config.N_PREA) * sym_len + double(config.N_SYM) * sym_len;
