@@ -247,7 +247,7 @@ rxSamples = rawSamples;
 
 
 %% SYNCHRONISATION ET STO
-% 1) Detection du preambule par correlation
+% 3) Detection du preambule par correlation
 if isempty(preamble)
     error('RX: preambule vide. Impossible de faire la detection STO.');
 end
@@ -327,7 +327,7 @@ ylabel('Amplitude');
 title('Avant alignement - I/Q');
 legend('I','Q');
 ylim([-1 1]);
-xline((startIndex-1)/fs, '--k', 'Début détecté');
+xline((startIndex-1)/fs, '--k', 'DÃ©but dÃ©tectÃ©');
 
 % I/Q apres
 nexttile(tl);
@@ -335,7 +335,7 @@ plot(tAfter, real(sAfter), 'b', tAfter, imag(sAfter), 'r');
 grid on;
 xlabel('Temps depuis alignement (s)');
 ylabel('Amplitude');
-title('Après alignement - I/Q');
+title('AprÃ¨s alignement - I/Q');
 legend('I','Q');
 ylim([-1 1]);
 
@@ -347,7 +347,7 @@ xlabel('Temps (s)');
 ylabel('|s(t)|');
 title('Avant alignement - enveloppe');
 ylim([0 1]);
-xline((startIndex-1)/fs, '--r', 'Début détecté');
+xline((startIndex-1)/fs, '--r', 'DÃ©but dÃ©tectÃ©');
 
 % Enveloppe apres
 nexttile(tl);
@@ -355,7 +355,7 @@ plot(tAfter, abs(sAfter), 'k');
 grid on;
 xlabel('Temps depuis alignement (s)');
 ylabel('|s(t)|');
-title('Après alignement - enveloppe');
+title('AprÃ¨s alignement - enveloppe');
 ylim([0 1]);
 
 % Constellation brute apres
@@ -368,7 +368,7 @@ xlim([-1 1]);
 ylim([-1 1]);
 xlabel('I');
 ylabel('Q');
-title('Après alignement - constellation brute');
+title('AprÃ¨s alignement - constellation brute');
 
 fprintf('RX: comparaison avant/apres alignement affichee.\n');
 
@@ -447,7 +447,7 @@ fprintf('RX: visualisation apres correction CFO terminee.\n');
 %% CONFIG ENVIRONNEMENT 
 function config = default_ofdm_config()
     % Parametres globaux centralises (RF + OFDM + synchronisation).
-    config.bladeRFRoot      = 'C:\Users\yoyol\OneDrive\UQTR-Yohan\1-Systèmes de télécommunications\Projet';
+    config.bladeRFRoot      = 'C:\Users\yoyol\OneDrive\UQTR-Yohan\1-SystÃ¨mes de tÃ©lÃ©communications\Projet';
     config.bladeRFMatlabDir = fullfile(config.bladeRFRoot, 'matlab');
 
     % Parametres RF
@@ -486,7 +486,7 @@ function b = configure_bladerf(b, sampleRateHz, centerFrequencyHz, bandwidthHz, 
     b.tx.bandwidth  = bandwidthHz;
 
     b.tx.gain = txGainDb;
-    b.rx.gain = rxGainDb;
+    b.rx.
 
     b.rx.config.timeout_ms = streamTimeoutMs;
     b.tx.config.timeout_ms = streamTimeoutMs;
@@ -496,4 +496,21 @@ function b = configure_bladerf(b, sampleRateHz, centerFrequencyHz, bandwidthHz, 
     fprintf('  Sample rate        : %.3f MS/s\n', sampleRateHz/1e6);
     fprintf('  Bande passante     : %.3f MHz\n', bandwidthHz/1e6);
     fprintf('  Gain TX            : %.1f dB\n', txGainDb);
+end
+
+%% PERMET LE TRAVAIL PARRALEL RX/TX
+function [samples, ts_out, actual_count, overrun] = rx_worker_bladerf(serialNumber, centerFrequencyHz, sampleRateHz, bandwidthHz, streamTimeoutMs, rx_ts, rx_len)
+
+    b_rx = bladeRF(['*:serial=' serialNumber]);
+
+    b_rx.rx.frequency  = centerFrequencyHz;
+    b_rx.rx.samplerate = sampleRateHz;
+    b_rx.rx.bandwidth  = bandwidthHz;
+    b_rx.rx.config.timeout_ms = streamTimeoutMs;
+
+    b_rx.rx.start();
+
+    [samples, ts_out, actual_count, overrun] = b_rx.receive(rx_len, streamTimeoutMs, rx_ts);
+
+    b_rx.rx.stop();
 end

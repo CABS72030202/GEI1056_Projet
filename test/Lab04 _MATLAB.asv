@@ -1,4 +1,4 @@
-%OFM YOHAN Lineaire and no poopoo no use
+% OFDM YOHAN test lab 04
 clear; clc; close all;
 
 %% Preparation de l'environnement
@@ -15,19 +15,16 @@ fprintf('bladeRF ouvert avec succes.\n');
 fprintf('  Serial : %s\n', strtrim(b.info.serial));
 
 
-
 %% ============================================================
-% Chaine TX OFDM complete sans fonction
+% Chaine TX OFDM
 % bits -> QAM -> grille OFDM -> IFFT -> CP -> preambule -> txBuffer
 %% ============================================================
-
 % 1) Configuration
 N_FFT   = 64;
 N_CP    = N_FFT/4;
 N_VC    = N_FFT/4;
 N_USED  = N_FFT - N_VC;
 N_SYM   = 12;
-N_PREA  = 4;
 M_ORDER = 16;
 sampleRateHz = 2.5e6;
 centerFrequencyHz = 2.45e9;
@@ -38,136 +35,75 @@ streamTimeoutMs = 5000;
 
 b = configure_bladerf(b, sampleRateHz, centerFrequencyHz, bandwidthHz, txGainDb, rxGainDb, streamTimeoutMs);
 
-
-bits_per_sym = log2(M_ORDER);
-
 K = N_USED/2;
 data_bins_shift = [-K:-1 1:K];
 
 % Indices MATLAB des sous-porteuses utilisees
 used_bins = mod(data_bins_shift, N_FFT) + 1;
 
+
 % 2) Generation des bits
+bits_per_sym = log2(M_ORDER);
 n_data_symbols = N_USED * N_SYM;
 total_bits = n_data_symbols * bits_per_sym;
-
 txBits = randi([0 1], total_bits, 1);
-
-fprintf('TX: %d bits generes pour %d symboles QAM.\n', total_bits, n_data_symbols);
 
 
 % 3) Modulation QAM
 bitGroups = reshape(txBits, bits_per_sym, []).';
-
 symbol_indices = bi2de(bitGroups, 'left-msb');
-
 txSymbols = qammod(symbol_indices, M_ORDER,'gray', 'InputType', 'integer', 'UnitAveragePower', true);
-
-fprintf('TX: modulation %d-QAM terminee.\n', M_ORDER);
 
 
 % 4) Conversion serie-parallele
 parallelSymbols = reshape(txSymbols, N_USED, N_SYM);
-
 frequencyGridShift = complex(zeros(N_FFT, N_SYM));
-
 frequencyGridShift(used_bins, :) = parallelSymbols;
-
-fprintf('TX: grille OFDM construite [%d x %d].\n',size(frequencyGridShift,1), size(frequencyGridShift,2));
 
 
 % 5) IFFT : domaine frequentiel -> domaine temporel
 X_ifft_in = ifftshift(frequencyGridShift, 1);
-
 x_time = ifft(X_ifft_in, N_FFT, 1);
-
-fprintf('TX: IFFT terminee.\n');
 
 
 % 6) Ajout du CP
 x_cp = [x_time(end-N_CP+1:end, :); x_time];
-
 payload = x_cp(:);
-
-fprintf('TX: CP ajoute. Payload = %d echantillons.\n', numel(payload));
 
 
 % 7) Construction du preambule
-preamble_freq_shift = complex(zeros(N_FFT, 1));
-
-alt = (-1).^(0:numel(used_bins)-1).';
-preamble_freq_shift(used_bins) = complex(alt, 0);
-
-preamble_time = ifft(ifftshift(preamble_freq_shift, 1), N_FFT, 1);
-
-preamble_sym = [preamble_time(end-N_CP+1:end); preamble_time];
-
-sign_pattern = repmat([1, -1], 1, ceil(N_PREA/2));
-sign_pattern = sign_pattern(1:N_PREA);
-
+N_PREA  = 8;  %R√©p√©tition du preambule
 preamble = [];
 
+preamble_freq_shift = complex(zeros(N_FFT, 1));
+alt = (-1).^(0:numel(used_bins)-1).';
+preamble_freq_shift(used_bins) = complex(alt, 0);
+preamble_time = ifft(ifftshift(preamble_freq_shift, 1), N_FFT, 1);
+preamble_sym = [preamble_time(end-N_CP+1:end); preamble_time];
+sign_pattern = repmat([1, -1], 1, ceil(N_PREA/2));
+sign_pattern = sign_pattern(1:N_PREA);
+    %Alternance de signe pour un premabule r√©p√©t√©
 for k = 1:N_PREA
     preamble = [preamble; preamble_sym * sign_pattern(k)];
-end
+end 
 
-fprintf('TX: preambule construit (%d repetitions, %d echantillons).\n',N_PREA, numel(preamble));
+% 8) Zero padding
+pad = complex(zeros(round(0.005 * sampleRateHz), 1)); % 5 ms de silence
+
+% 9) Cr√©ation du signal
+%N_REP = 20; %r√©pition du signal pour faire comme lab04
+timeSignal = [preamble; payload]; 
+txFrame = [pad; timeSignal; pad];
 
 
-% 8) Trame complete
-timeSignal = [preamble; payload];
-
-fprintf('TX: trame complete = %d echantillons.\n', numel(timeSignal));
-
-
-% 9) Normalisation du buffer TX
-peak_abs = max(abs(timeSignal));
-
+% 10) Normalisation du buffer TX ET PEAK LIMITING (PAPR)
+peak_abs = max(abs(txFrame));
 if peak_abs <= 0
-    txBuffer = complex(single(timeSignal));
+    txBuffer = complex(single(txFrame));
 else
     scale = 0.8 / peak_abs;
-    txBuffer = complex(single(timeSignal * scale));
+    txBuffer = complex(single(txFrame * scale));
 end
-
-fprintf('TX: buffer normalise. Peak final = %.3f.\n', max(abs(txBuffer)));
-
-% 10) Visualisation TX
-n_plot = min(numel(txBuffer), 2000);
-t = (0:n_plot-1).' / sampleRateHz;
-s = double(txBuffer(1:n_plot));
-
-figure('Name', 'TX Signal Visualization', 'NumberTitle', 'off');
-
-tiledlayout(4,1,'TileSpacing','compact','Padding','compact');
-
-nexttile;
-plot(t, real(s), 'b', t, imag(s), 'r');
-grid on;
-xlabel('Temps (s)');
-ylabel('Amplitude');
-legend('I','Q');
-title('Signal TX I/Q');
-
-nexttile;
-plot(t, abs(s), 'k');
-grid on;
-xlabel('Temps (s)');
-ylabel('|s(t)|');
-title('Enveloppe TX');
-
-nexttile([2 1]);
-scatter(real(txSymbols), imag(txSymbols), 10, 'filled', ...
-    'MarkerFaceAlpha', 0.35);
-grid on;
-axis equal;
-xlim([-1 1]);
-ylim([-1 1]);
-xlabel('In-phase (I)');
-ylabel('Quadrature (Q)');
-title('Constellation TX');
-
-
 
 
 %% ============================================================
@@ -204,8 +140,7 @@ b.transmit(double(txBuffer(:)), streamTimeoutMs, tx_ts, true, true);
 
 % Capturer autour du burst
 fprintf('BladeRF: capture RX...\n');
-[rawSamples, ts_out, actual_count, overrun] = ...
-    b.receive(rx_len, streamTimeoutMs, rx_ts);
+[rawSamples, ts_out, actual_count, overrun] = b.receive(rx_len, streamTimeoutMs, rx_ts);
 
 rawSamples = rawSamples(:);
 
@@ -225,12 +160,12 @@ b.rx.stop();
 b.tx.stop();
 
 
-%% ============================================================
-% RX OFDM LINEAIRE - SANS FONCTION
-% Reception diagnostic + detection preambule/STO
-%% ============================================================
 
 
+%% ============================================================
+% RX OFDM LINEAIRE
+% Reception diagnostic
+%% ============================================================
 % 1) Recuperer les echantillons bruts
 rawSamples = rawSamples(:);
 
@@ -243,7 +178,6 @@ else
 end
 
 rxSamples = rawSamples;
-
 
 
 %% SYNCHRONISATION ET STO
@@ -274,180 +208,155 @@ corrMetric = abs(corrComplex);
 
 estimatedSTO = startIndex - 1;
 
-fprintf('RX: preambule detecte a l''echantillon %d.\n', startIndex);
-fprintf('RX: STO estime = %d echantillons.\n', estimatedSTO);
-fprintf('RX: pic de correlation = %.4e.\n', peakValue);
-
 % 4) Correction STO : aligner la trame sur le preambule
 alignedFrame = rxSamples(startIndex:end);
 
-fprintf('RX: trame alignee = %d echantillons.\n', numel(alignedFrame));
-
-% 5) Visualisation de la correlation
-
-figure('Name', 'RX - Detection preambule', 'NumberTitle', 'off');
-plot(corrMetric, 'k');
-grid on;
-xlabel('Indice de correlation');
-ylabel('|Correlation|');
-title('Detection du preambule par correlation');
-
-
-% 6) Comparaison RX avant et apres alignement STO
-
-fs = sampleRateHz;
-
-frameLength = length(preamble) + length(payload);
-
-rxBefore = rawSamples(:);
-rxAfter  = alignedFrame(:);
-
-% Meme longueur affichee pour comparer proprement
-nBefore = min(length(rxBefore), frameLength + startIndex - 1);
-nAfter  = min(length(rxAfter), frameLength);
-
-sBefore = double(rxBefore(1:nBefore));
-sAfter  = double(rxAfter(1:nAfter));
-
-tBefore = (0:nBefore-1).' / fs;
-tAfter  = (0:nAfter-1).' / fs;
-
-figure('Name', 'Comparaison RX avant/apres alignement STO', ...
-       'NumberTitle', 'off', ...
-       'Position', [100, 80, 900, 700]);
-
-tl = tiledlayout(3, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
-
-% I/Q avant
-nexttile(tl);
-plot(tBefore, real(sBefore), 'b', tBefore, imag(sBefore), 'r');
-grid on;
-xlabel('Temps (s)');
-ylabel('Amplitude');
-title('Avant alignement - I/Q');
-legend('I','Q');
-ylim([-1 1]);
-xline((startIndex-1)/fs, '--k', 'DÈbut dÈtectÈ');
-
-% I/Q apres
-nexttile(tl);
-plot(tAfter, real(sAfter), 'b', tAfter, imag(sAfter), 'r');
-grid on;
-xlabel('Temps depuis alignement (s)');
-ylabel('Amplitude');
-title('AprËs alignement - I/Q');
-legend('I','Q');
-ylim([-1 1]);
-
-% Enveloppe avant
-nexttile(tl);
-plot(tBefore, abs(sBefore), 'k');
-grid on;
-xlabel('Temps (s)');
-ylabel('|s(t)|');
-title('Avant alignement - enveloppe');
-ylim([0 1]);
-xline((startIndex-1)/fs, '--r', 'DÈbut dÈtectÈ');
-
-% Enveloppe apres
-nexttile(tl);
-plot(tAfter, abs(sAfter), 'k');
-grid on;
-xlabel('Temps depuis alignement (s)');
-ylabel('|s(t)|');
-title('AprËs alignement - enveloppe');
-ylim([0 1]);
-
-% Constellation brute apres
-nexttile(tl);
-scatter(real(sAfter), imag(sAfter), 8, 'filled', ...
-    'MarkerFaceAlpha', 0.25);
-grid on;
-axis equal;
-xlim([-1 1]);
-ylim([-1 1]);
-xlabel('I');
-ylabel('Q');
-title('AprËs alignement - constellation brute');
-
-fprintf('RX: comparaison avant/apres alignement affichee.\n');
+% 5) Extraction propre des donn√©es
+Lpre = length(preamble);
+payload_start = startIndex + Lpre;
+payload_end   = payload_start + length(payload) - 1;
+if payload_end > length(rxSamples)
+    error('Pas assez d''echantillons apres synchro');
+end
+rxPreamble = rxSamples(startIndex : startIndex + Lpre - 1);
+rxPayload  = rxSamples(payload_start : payload_end);
 
 
 %% CFO
-n_cfo = (0:length(alignedFrame)-1).';
-Lpre = length(preamble_sym);
+sym_len = N_FFT + N_CP;
+payload_len_expected = N_SYM * sym_len;
+rxPayload_forCFO = rxPayload(1:payload_len_expected);
+rxSymsCP = reshape(rxPayload_forCFO, sym_len, N_SYM);
 
-r1 = alignedFrame(1:Lpre);
-r2 = -alignedFrame(Lpre+1:2*Lpre);
+% Estimation du CFO normalis√© avec le CP
+eps_list = zeros(N_SYM, 1);
+for k = 1:N_SYM
+    r = rxSymsCP(:, k);
+    cp_part   = r(1:N_CP);
+    tail_part = r(N_FFT+1:N_FFT+N_CP);
+    phase_val = sum(conj(cp_part) .* tail_part);
+    eps_list(k) = angle(phase_val) / (2*pi*N_FFT);
+end
+eps_hat = mean(eps_list);
+CFO_Hz = eps_hat * sampleRateHz;
+fprintf('RX: CFO estime par CP = %.2f Hz\n', CFO_est_Hz);
 
-phaseProduct = conj(r1).*r2;
-phaseSum = sum(phaseProduct);
-phaseDiff = angle(phaseSum);
+% Correction CFO
+n_cfopreamble = (0:length(preamble)-1).';
+n_cfopayload  = (0:length(alignedFrame)-1).';
+rxPreambleCFO = rxPreamble.* exp(-1j*2*pi*eps_hat*n_cfo);
+rxPayloadCFO  = rxPayload .* exp(-1j*2*pi*eps_hat*n_cfo);
 
-CFO_est_Hz = phaseDiff / (2*pi*Lpre/sampleRateHz);
 
-alignedFrameCFOcorr = alignedFrame .* exp(-1j*2*pi*CFO_est_Hz*n_cfo/sampleRateHz);
+%%Estimation du canal avec preambule
+% Reformer les repetitions du preambule
+rxPreBlk = reshape(rxPreambleCFO, sym_len, N_PREA);
 
-fprintf('RX: CFO estime = %.2f Hz\n', CFO_est_Hz);
+% Corriger l'alternance de signe du preambule : + - + - 
+for k = 1:N_PREA
+    rxPreBlk(:, k) = rxPreBlk(:, k) * sign_pattern(k);
+end
 
-%Affichage
-fs = sampleRateHz;
+% Reformer les symboles OFDM du payload
+rxPaySyms = reshape(rxPayloadCFO, sym_len, N_SYM);
 
-frameLength = length(preamble) + length(payload);
+% Reference frequentielle connue du preambule
+XtrainUsed = preamble_freq_shift(used_bins);
 
-rxAfterCFO = alignedFrameCFOcorr(:);
+bestMetric = -inf;
+bestOffset = 0;
+bestHUsed = [];
+metrics = -inf(N_CP, 1);
 
-nAfterCFO = min(length(rxAfterCFO), frameLength);
+for off = 0:N_CP-1
 
-sAfterCFO = double(rxAfterCFO(1:nAfterCFO));
+    H_list = [];
+    % Estimer le canal avec chaque repetition du preambule
+    for k = 1:N_PREA
+        pre_k = rxPreBlk(off+1 : off+N_FFT, k);
+        Yk = fft(pre_k, N_FFT);
+        Yk_shift = fftshift(Yk);
+        Yk_used = Yk_shift(used_bins);
+        Hk = Yk_used ./ (XtrainUsed + 1e-12);
+        H_list = [H_list, Hk];
+    end
 
-tAfterCFO = (0:nAfterCFO-1).' / fs;
+    % Canal moyen sur les repetitions du preambule
+    H_used = mean(H_list, 2);
 
-figure('Name', 'RX apres correction CFO', ...
-       'NumberTitle', 'off', ...
-       'Position', [650, 80, 500, 900]);
+    % Tester le meme offset sur le payload
+    x_win = rxPaySyms(off+1 : off+N_FFT, :);
+    Y = fft(x_win, N_FFT, 1);
+    Y_shift = fftshift(Y, 1);
+    Y_used = Y_shift(used_bins, :);
 
-tl = tiledlayout(3, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+    % Egalisation temporaire pour evaluer la qualite de l'offset
+    Yeq = Y_used ./ (H_used + 1e-12);
+    metric = mean(abs(mean(Yeq, 1)));
+    metrics(off+1) = metric;
 
-nexttile(tl);
-plot(tAfterCFO, real(sAfterCFO), 'b', ...
-     tAfterCFO, imag(sAfterCFO), 'r');
-grid on;
-xlabel('Temps depuis alignement (s)');
-ylabel('Amplitude');
-legend('I', 'Q');
-title('RX apres correction CFO - I/Q');
-ylim([-1 1]);
+    if metric > bestMetric
+        bestMetric = metric;
+        bestOffset = off;
+        bestHUsed = H_used;
+    end
+end
 
-nexttile(tl);
-plot(tAfterCFO, abs(sAfterCFO), 'k');
-grid on;
-xlabel('Temps depuis alignement (s)');
-ylabel('|s(t)|');
-title('RX apres correction CFO - enveloppe');
-ylim([0 1]);
+H_used_final = bestHUsed;
 
-nexttile(tl);
-scatter(real(sAfterCFO), imag(sAfterCFO), 8, 'filled', ...
-    'MarkerFaceAlpha', 0.25);
+%% ============================================================
+% OFDM DEMOD : CP-CFO PAR SYMBOLE + CP FINE TIMING + FFT
+%% ============================================================
+
+rxPayloadSyms = reshape(rxPayloadCFO, sym_len, N_SYM);
+rxPayloadSymsCFO = zeros(size(rxPayloadSyms));
+eps_sym = zeros(N_SYM, 1);
+
+for m = 1:N_SYM
+    sym80 = rxPayloadSyms(:, m);
+    cp_part   = sym80(1:N_CP);
+    tail_part = sym80(N_FFT+1 : N_FFT+N_CP);
+    val = sum(cp_part .* conj(tail_part));
+    eps_m = angle(val) / (2*pi*N_FFT);
+    eps_sym(m) = eps_m;
+    n_sym = (0:sym_len-1).';
+    rxPayloadSymsCFO(:, m) = sym80 .* exp(-1j*2*pi*eps_m*n_sym);
+end
+
+% Retirer le CP avec le meilleur offset
+x_no_cp = rxPayloadSymsCFO(bestOffset+1 : bestOffset+N_FFT, :);
+
+% FFT finale
+Y_fft_ch5 = fft(x_no_cp, N_FFT, 1);
+Y_fft_shift_ch5 = fftshift(Y_fft_ch5, 1);
+
+% Sous-porteuses utiles
+Y_used_ch5 = Y_fft_shift_ch5(used_bins, :);
+
+fprintf('RX: FFT finale terminee avec CP offset = %d\n', bestOffset);
+
+%% Affichage constellation apres synchro + CFO + FFT, sans egalisation
+
+figure('Name', 'RX constellation apres CP-CFO + timing fin + FFT', ...
+       'NumberTitle', 'off');
+
+scatter(real(Y_used_ch5(:)), imag(Y_used_ch5(:)), 10, 'filled', ...
+    'MarkerFaceAlpha', 0.35);
+
 grid on;
 axis equal;
-xlim([-1 1]);
-ylim([-1 1]);
 xlabel('I');
 ylabel('Q');
-title('Constellation brute apres correction CFO');
-
-fprintf('RX: visualisation apres correction CFO terminee.\n');
-
-
+title(sprintf('RX constellation apres CP-CFO + CP fine timing + FFT | CPoff=%d', bestOffset));
+xlim([-3 3]);
+ylim([-3 3]);
 
 
 
 %% CONFIG ENVIRONNEMENT 
 function config = default_ofdm_config()
     % Parametres globaux centralises (RF + OFDM + synchronisation).
-    config.bladeRFRoot      = 'C:\Users\yoyol\OneDrive\UQTR-Yohan\1-SystËmes de tÈlÈcommunications\Projet';
+    config.bladeRFRoot      = 'C:\Users\yoyol\OneDrive\UQTR-Yohan\1-Syst√®mes de t√©l√©communications\Projet';
     config.bladeRFMatlabDir = fullfile(config.bladeRFRoot, 'matlab');
 
     % Parametres RF
