@@ -1,9 +1,10 @@
-% module_ofdm.m
-% Script principal du systeme de communication OFDM sur bladeRF.
-% Ce script orchestre la chaine complete de transmission et de reception:
+% module_ofdm_single.m
+% Script principal du systeme de communication OFDM sur un seul bladeRF.
+% Ce script orchestre la chaine complete de transmission et de reception en duplex
+% sur une meme radio, permettant l'emission et la reception simultanees:
 % 1) Charger la configuration des parametres RF et OFDM.
-% 2) Ouvrir et configurer la radio bladeRF.
-% 3) Construire la trame TX, synchroniser les horloges TX/RX, capturer le signal.
+% 2) Ouvrir et configurer la radio bladeRF unique pour TX et RX.
+% 3) Construire la trame TX et synchroniser les horloges TX/RX pour capturer le signal.
 % 4) Traiter les echantillons recus (synchronisation, egalisation, demodulation).
 % 5) Fermer proprement la radio.
 
