@@ -3,11 +3,6 @@
 % Chaque machine execute ce meme script, avec un role fixe:
 % - role = 'TX' : emission uniquement
 % - role = 'RX' : reception + traitement uniquement
-%
-% NOTE: la synchronisation inter-PC fine sera ajoutee plus tard.
-% Ici, la synchro manuelle est rendue robuste via:
-% - TX en bursts repetes
-% - RX en surcapture longue
 
 clear; clc; close all;
 
@@ -45,7 +40,9 @@ switch nodeRole
 		% les fonctions de synchro/egalisation/decode deja existantes.
 		txContext = module_tx(config);
 		rawRxSamples = receive_only(radio, txContext, config);
-		rxContext = module_rx(rawRxSamples, config, txContext); %#ok<NASGU>
+		% Correction SFO (derive d'horloge VCTCXO) avant de passer a module_rx.
+		correctedSamples = estimate_and_correct_sfo(rawRxSamples, txContext, config);
+		rxContext = module_rx(correctedSamples, config, txContext); %#ok<NASGU>
 end
 
 %% -----------------------------------------------------------------------
@@ -192,6 +189,101 @@ function rawSamples = receive_only(radio, txContext, config)
 	if overrun
 		warning('module_ofdm_double:rxOverrun', 'Overrun detecte pendant la capture RX.');
 	end
+end
+
+
+function correctedSamples = estimate_and_correct_sfo(rawSamples, txContext, config)
+% Estimer et corriger le SFO (Sample Frequency Offset) entre les deux bladeRF.
+%
+% Principe:
+%   1) Correlater le preambule connu sur la surcapture pour trouver les pics
+%      correspondant aux differents bursts TX.
+%   2) Comparer l'espacement mesure entre deux pics avec l'espacement nominal
+%      attendu (burst_period_samples) -> donne epsilon en ppm.
+%   3) Rééchantillonner le flux RX avec resample(x, p, q) pour compenser.
+%      ratio = 1/(1+epsilon), approxime en fraction rationnelle p/q.
+%   4) Le flux corrige a la bonne cadence d'echantillonnage nominale;
+%      module_rx peut alors s'en servir normalement.
+
+	correctedSamples = rawSamples;  % par defaut, pas de correction
+
+	if isempty(rawSamples) || ~isfield(txContext, 'preamble') || isempty(txContext.preamble)
+		warning('module_ofdm_double:sfo', 'Donnees insuffisantes pour estimer le SFO.');
+		return;
+	end
+
+	% --- 1) Correlation preambule pour detecter les pics de bursts ---
+	pre = txContext.preamble(:);
+	raw = rawSamples(:);
+	corr = abs(conv(raw, conj(flipud(pre)), 'valid'));
+
+	% Normaliser pour avoir un seuil independant du niveau de puissance.
+	corr_norm = corr / (max(corr) + eps);
+
+	% L'espacement attendu entre bursts en echantillons (d'apres la config TX).
+	fs = config.sampleRateHz;
+	pre_len = numel(pre);
+	period_samples = max( ...
+		round(double(config.txBurstPeriodMs) * fs / 1000), ...
+		numel(txContext.txBuffer) + round(0.001 * fs));
+
+	% Trouver les pics avec une zone d'exclusion = period/2 autour de chaque pic.
+	exclude = max(1, round(period_samples / 2));
+	peaks_idx = [];
+	corr_copy = corr_norm;
+	threshold = 0.3;
+	for attempt = 1:config.txBurstCount
+		[peak_val, peak_pos] = max(corr_copy);
+		if peak_val < threshold, break; end
+		peaks_idx(end+1) = peak_pos; %#ok<AGROW>
+		% Exclure le voisinage de ce pic pour le prochain tour.
+		i_lo = max(1, peak_pos - exclude);
+		i_hi = min(numel(corr_copy), peak_pos + exclude);
+		corr_copy(i_lo:i_hi) = 0;
+	end
+
+	if numel(peaks_idx) < 2
+		warning('module_ofdm_double:sfo', ...
+			'Moins de 2 pics detectes (%d): SFO non corrige.', numel(peaks_idx));
+		return;
+	end
+
+	% --- 2) Estimation de l'epsilon SFO ---
+	% Utiliser le premier et le dernier pic pour maximiser la resolution.
+	peaks_sorted = sort(peaks_idx);
+	pos1 = peaks_sorted(1);
+	pos2 = peaks_sorted(end);
+	n_gaps = peaks_sorted(end) - peaks_sorted(1);	% peut couvrir plusieurs periodes
+	n_periods = round(n_gaps / period_samples);
+
+	if n_periods < 1
+		warning('module_ofdm_double:sfo', 'Pics trop proches pour estimer le SFO.');
+		return;
+	end
+
+	measured_period = (pos2 - pos1) / n_periods;
+	epsilon = (measured_period - period_samples) / period_samples;
+	epsilon_ppm = epsilon * 1e6;
+
+	fprintf(['module_ofdm_double[RX]: SFO estime = %.2f ppm ' ...
+		'(pos1=%d, pos2=%d, n_periods=%d).\n'], epsilon_ppm, pos1, pos2, n_periods);
+
+	if abs(epsilon_ppm) < 0.1
+		fprintf('module_ofdm_double[RX]: SFO negligeable, pas de resampling.\n');
+		return;
+	end
+
+	% --- 3) Resampling pour compenser la derive d'horloge ---
+	% On veut que le RX ait la meme cadence que le TX:
+	%   ratio = f_s_TX / f_s_RX = 1 / (1 + epsilon)
+	% resample(x, p, q) produit p/q echantillons par echantillon d'entree.
+	N_rat = 10000;
+	p_rat = N_rat;
+	q_rat = round(N_rat * (1 + epsilon));
+	if q_rat < 1, q_rat = 1; end
+
+	correctedSamples = resample(raw, p_rat, q_rat);
+	fprintf('module_ofdm_double[RX]: resampling %d/%d applique.\n', p_rat, q_rat);
 end
 
 
