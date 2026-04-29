@@ -1,5 +1,6 @@
-% OFDM YOHAN test lab 04
-clear; clc; close all;
+%% OFDM TRANSMISSION - BLADE RF
+%% RX MODULE 
+
 
 %% Preparation de l'environnement
 config = default_ofdm_config();
@@ -7,7 +8,8 @@ addpath(config.bladeRFMatlabDir);
 if ~contains(lower(getenv('PATH')), lower(config.bladeRFRoot))
     setenv('PATH', [config.bladeRFRoot ';' getenv('PATH')]);
 end
-rng(1,'twister');
+
+rng(1,'twister'); %Randomness seed
 
 %% Ouverture du bladeRF
 b = bladeRF();
@@ -15,11 +17,10 @@ fprintf('bladeRF ouvert avec succes.\n');
 fprintf('  Serial : %s\n', strtrim(b.info.serial));
 
 
+
 %% ============================================================
-% Chaine TX OFDM
-% bits -> QAM -> grille OFDM -> IFFT -> CP -> preambule -> txBuffer
+%  Configuration
 %% ============================================================
-% 1) Configuration
 N_FFT   = 64;
 N_CP    = N_FFT/4;
 N_VC    = N_FFT/4;
@@ -29,52 +30,34 @@ M_ORDER = 16;
 sampleRateHz = 2.5e6;
 centerFrequencyHz = 2.45e9;
 bandwidthHz = 2.5e6;
-txGainDb = 30;
+txGainDb = 40;
 rxGainDb = 40;
-streamTimeoutMs = 5000;
+streamTimeoutMs = 5000
 
 b = configure_bladerf(b, sampleRateHz, centerFrequencyHz, bandwidthHz, txGainDb, rxGainDb, streamTimeoutMs);
-
 K = N_USED/2;
 data_bins_shift = [-K:-1 1:K];
-
 % Indices MATLAB des sous-porteuses utilisees
 used_bins = mod(data_bins_shift, N_FFT) + 1;
 
-
-% 2) Generation des bits
+% 2) Generation des bits (SERA UTILISÉ SEULEMENT POUR LE BER)
 bits_per_sym = log2(M_ORDER);
 n_data_symbols = N_USED * N_SYM;
 total_bits = n_data_symbols * bits_per_sym;
 txBits = randi([0 1], total_bits, 1);
-
-
 % 3) Modulation QAM
 bitGroups = reshape(txBits, bits_per_sym, []).';
 symbol_indices = bi2de(bitGroups, 'left-msb');
 txSymbols = qammod(symbol_indices, M_ORDER,'gray', 'InputType', 'integer', 'UnitAveragePower', true);
-
-
-% 4) Conversion serie-parallele
+% 4) Conversion serie-parallele (SERA UTILISÉ SEULEMENT POUR LE BER)
 parallelSymbols = reshape(txSymbols, N_USED, N_SYM);
 frequencyGridShift = complex(zeros(N_FFT, N_SYM));
 frequencyGridShift(used_bins, :) = parallelSymbols;
 
 
-% 5) IFFT : domaine frequentiel -> domaine temporel
-X_ifft_in = ifftshift(frequencyGridShift, 1);
-x_time = ifft(X_ifft_in, N_FFT, 1);
-
-
-% 6) Ajout du CP
-x_cp = [x_time(end-N_CP+1:end, :); x_time];
-payload = x_cp(:);
-
-
-% 7) Construction du preambule
+% PREAMBULE IDENTIQUE SUR RX/TX
 N_PREA  = 8;  %Répétition du preambule
 preamble = [];
-
 preamble_freq_shift = complex(zeros(N_FFT, 1));
 alt = (-1).^(0:numel(used_bins)-1).';
 preamble_freq_shift(used_bins) = complex(alt, 0);
@@ -87,100 +70,44 @@ for k = 1:N_PREA
     preamble = [preamble; preamble_sym * sign_pattern(k)];
 end 
 
-% 8) Zero padding
-pad = complex(zeros(round(0.005 * sampleRateHz), 1)); % 5 ms de silence
-
-% 9) Création du signal
-%N_REP = 20; %répition du signal pour faire comme lab04
-timeSignal = [preamble; payload]; 
-txFrame = [pad; timeSignal; pad];
-
-
-% 10) Normalisation du buffer TX ET PEAK LIMITING (PAPR)
-peak_abs = max(abs(txFrame));
-if peak_abs <= 0
-    txBuffer = complex(single(txFrame));
-else
-    scale = 0.8 / peak_abs;
-    txBuffer = complex(single(txFrame * scale));
-end
-
 
 %% ============================================================
-% TRANSMISSION + CAPTURE BLADE RF
+%  CAPTURE BLADE RF
 %% ============================================================
 
-tx_len = numel(txBuffer);
+% Capture
+captureTimeSec = 1;   
+rx_len = round(captureTimeSec * sampleRateHz);
 
-preroll  = round(config.rxPrerollMs  * sampleRateHz / 1000);
-postroll = round(config.rxPostrollMs * sampleRateHz / 1000);
+fprintf('\nRX: capture de %d echantillons (%.3f ms)\n', rx_len, captureTimeSec);
 
-rx_len = tx_len + preroll + postroll;
-
-fprintf('\nBladeRF: tx_len = %d echantillons.\n', tx_len);
-fprintf('BladeRF: rx_len = %d echantillons.\n', rx_len);
-
-% Demarrer les modules TX/RX
+% Acquisition des données
 b.rx.start();
-b.tx.start();
-
-% Planifier TX dans le futur
-current_ts = double(b.rx.timestamp);
-tx_ts = uint64(current_ts + round(config.syncLeadTimeMs * sampleRateHz / 1000));
-
-% Planifier RX avant TX
-rx_ts = uint64(double(tx_ts) - preroll);
-
-fprintf('BladeRF: TX timestamp = %u.\n', tx_ts);
-fprintf('BladeRF: RX timestamp = %u.\n', rx_ts);
-
-% Envoyer le burst avec timestamp
-fprintf('BladeRF: transmission TX programmee...\n');
-b.transmit(double(txBuffer(:)), streamTimeoutMs, tx_ts, true, true);
-
-% Capturer autour du burst
-fprintf('BladeRF: capture RX...\n');
-[rawSamples, ts_out, actual_count, overrun] = b.receive(rx_len, streamTimeoutMs, rx_ts);
+[rawSamples, ts_out, actual_count, overrun] = b.receive(rx_len, streamTimeoutMs);
+b.rx.stop();
 
 rawSamples = rawSamples(:);
 
-if actual_count > 0 && actual_count < numel(rawSamples)
-    rawSamples = rawSamples(1:actual_count);
-end
-
-fprintf('BladeRF: %d echantillons captures.\n', numel(rawSamples));
-fprintf('BladeRF: timestamp RX retourne = %u.\n', ts_out);
+fprintf('RX: %d echantillons captures.\n', numel(rawSamples));
+fprintf('RX: timestamp retourne = %u.\n', ts_out);
 
 if overrun
-    warning('BladeRF: overrun detecte pendant la capture RX.');
+    warning('RX: overrun detecte pendant la capture.');
 end
-
-% Arret propre des modules
-b.rx.stop();
-b.tx.stop();
-
-
-
-
-%% ============================================================
-% RX OFDM LINEAIRE
-% Reception diagnostic
-%% ============================================================
-% 1) Recuperer les echantillons bruts
-rawSamples = rawSamples(:);
 
 if isempty(rawSamples)
     rawSamples = complex(zeros(N_FFT + N_CP, 1));
-    fprintf('RX: echantillons absents, buffer de secours cree (%d echantillons).\n', ...
-        numel(rawSamples));
-else
-    fprintf('RX: %d echantillons fournis pour traitement.\n', numel(rawSamples));
+    fprintf('RX: echantillons absents, buffer de secours cree (%d echantillons).\n',numel(rawSamples));
 end
-
 rxSamples = rawSamples;
 
 
-%% SYNCHRONISATION ET STO
+
+
+%% ============================================================
+%  Synchronisation et STO
+%% ============================================================
+
 % 1) Detection du preambule par correlation
 if isempty(preamble)
     error('RX: preambule vide. Impossible de faire la detection STO.');
@@ -197,7 +124,7 @@ end
 preambleConj = conj(preambleDouble);
 preambleMatched = flipud(preambleConj);
 
-% Correlation glissante
+% Correlation glissante(convolution)
 corrComplex = conv(rxSamplesDouble, preambleMatched, 'valid');
 
 % Magnitude de correlation
@@ -214,7 +141,7 @@ alignedFrame = rxSamples(startIndex:end);
 % 5) Extraction propre des données
 Lpre = length(preamble);
 payload_start = startIndex + Lpre;
-payload_end   = payload_start + length(payload) - 1;
+payload_end   = payload_start + payload_len_expected - 1;
 if payload_end > length(rxSamples)
     error('Pas assez d''echantillons apres synchro');
 end
@@ -222,7 +149,10 @@ rxPreamble = rxSamples(startIndex : startIndex + Lpre - 1);
 rxPayload  = rxSamples(payload_start : payload_end);
 
 
-%% CFO
+%% ============================================================
+%  CFO
+%% ============================================================
+
 sym_len = N_FFT + N_CP;
 payload_len_expected = N_SYM * sym_len;
 rxPayload_forCFO = rxPayload(1:payload_len_expected);
@@ -239,16 +169,18 @@ for k = 1:N_SYM
 end
 eps_hat = mean(eps_list);
 CFO_Hz = eps_hat * sampleRateHz;
-fprintf('RX: CFO estime par CP = %.2f Hz\n', CFO_est_Hz);
+fprintf('RX: CFO estime par CP = %.2f Hz\n', CFO_Hz);
 
 % Correction CFO
-n_cfopreamble = (0:length(preamble)-1).';
-n_cfopayload  = (0:length(alignedFrame)-1).';
-rxPreambleCFO = rxPreamble.* exp(-1j*2*pi*eps_hat*n_cfo);
-rxPayloadCFO  = rxPayload .* exp(-1j*2*pi*eps_hat*n_cfo);
+n_cfopreamble = (0:length(rxPreamble)-1).';
+n_cfopayload  = (0:length(rxPayload)-1).';
+rxPreambleCFO = rxPreamble.* exp(-1j*2*pi*eps_hat*n_cfopreamble);
+rxPayloadCFO  = rxPayload .* exp(-1j*2*pi*eps_hat*n_cfopayload);
 
 
-%%Estimation du canal avec preambule
+%% ============================================================
+%  Estimation du canal
+%% ============================================================
 % Reformer les repetitions du preambule
 rxPreBlk = reshape(rxPreambleCFO, sym_len, N_PREA);
 
@@ -302,54 +234,138 @@ for off = 0:N_CP-1
     end
 end
 
-H_used_final = bestHUsed;
+H_used_final = bestHUsed;   %Estimation final du canal
+
+
 
 %% ============================================================
-% OFDM DEMOD : CP-CFO PAR SYMBOLE + CP FINE TIMING + FFT
+% EGALISATION
 %% ============================================================
-
+% Reformer les symboles OFDM du payload apres correction CFO
 rxPayloadSyms = reshape(rxPayloadCFO, sym_len, N_SYM);
+
+% Correction CFO residuelle par symbole avec le CP
 rxPayloadSymsCFO = zeros(size(rxPayloadSyms));
 eps_sym = zeros(N_SYM, 1);
 
 for m = 1:N_SYM
+
     sym80 = rxPayloadSyms(:, m);
     cp_part   = sym80(1:N_CP);
-    tail_part = sym80(N_FFT+1 : N_FFT+N_CP);
-    val = sum(cp_part .* conj(tail_part));
+    tail_part = sym80(N_FFT+1:N_FFT+N_CP);
+    val = sum(conj(cp_part) .* tail_part);
     eps_m = angle(val) / (2*pi*N_FFT);
     eps_sym(m) = eps_m;
     n_sym = (0:sym_len-1).';
     rxPayloadSymsCFO(:, m) = sym80 .* exp(-1j*2*pi*eps_m*n_sym);
+
 end
 
-% Retirer le CP avec le meilleur offset
+fprintf('RX: CFO residuel moyen par symbole = %.2f Hz\n',mean(eps_sym) * sampleRateHz);
+
+% Retrait du CP avec le meilleur offset trouve
 x_no_cp = rxPayloadSymsCFO(bestOffset+1 : bestOffset+N_FFT, :);
 
 % FFT finale
-Y_fft_ch5 = fft(x_no_cp, N_FFT, 1);
-Y_fft_shift_ch5 = fftshift(Y_fft_ch5, 1);
+Y_fft = fft(x_no_cp, N_FFT, 1);
+Y_fft_shift = fftshift(Y_fft, 1);
 
-% Sous-porteuses utiles
-Y_used_ch5 = Y_fft_shift_ch5(used_bins, :);
+% Extraction des sous-porteuses utiles
+Y_used = Y_fft_shift(used_bins, :);
 
-fprintf('RX: FFT finale terminee avec CP offset = %d\n', bestOffset);
+% Egalisation avec le canal estime par preambule
+rxEq = Y_used ./ (H_used_final + 1e-12);
 
-%% Affichage constellation apres synchro + CFO + FFT, sans egalisation
 
-figure('Name', 'RX constellation apres CP-CFO + timing fin + FFT', ...
-       'NumberTitle', 'off');
+%% ============================================================
+% CPE CORRECTION
+%% ============================================================
 
-scatter(real(Y_used_ch5(:)), imag(Y_used_ch5(:)), 10, 'filled', ...
-    'MarkerFaceAlpha', 0.35);
+% rxEq est [N_USED x N_SYM]
+Z = rxEq;
 
+% Reference TX dans la meme forme
+Xref = parallelSymbols;   % [N_USED x N_SYM]
+
+% Estimation du CPE par symbole OFDM
+theta_hat = angle(sum(Z .* conj(Xref), 1) + 1e-12);
+
+% Correction CPE
+Z_cpe = Z .* exp(-1j * theta_hat);
+
+% Sauvegarde du signal corrige
+rxEqCPE = Z_cpe;
+
+fprintf('RX: CPE par symbole (rad):\n');
+disp(round(theta_hat, 3));
+
+% Pour la suite, utiliser rxEqCPE au lieu de rxEq
+rxQAM = rxEqCPE(:);
+
+
+%% ============================================================
+% DÉMODULATION
+%% ============================================================
+rxInts = qamdemod(rxQAM, M_ORDER,'gray','OutputType', 'integer','UnitAveragePower', true);
+
+%Conversion entiers -> bits
+rxBitGroups = de2bi(rxInts, bits_per_sym, 'left-msb');
+rxBits = reshape(rxBitGroups.', [], 1);
+
+
+%% ============================================================
+% CALCUL DU BER
+%% ============================================================
+bitComparison = (rxBits ~= txBits);
+bitErrors = sum(bitComparison);
+BER = bitErrors / total_bits;
+
+fprintf('\n===== RESULTATS BER =====\n');
+fprintf('Bits transmis = %d\n', total_bits);
+fprintf('Erreurs bits  = %d\n', bitErrors);
+fprintf('BER           = %.3e\n', BER);
+
+
+
+%% ============================================================
+% AFFICHAGE
+%% ============================================================
+
+%IQ
+figure(1);
+scatter(real(rxQAM), imag(rxQAM), 10, 'filled','MarkerFaceAlpha', 0.35);
 grid on;
 axis equal;
 xlabel('I');
 ylabel('Q');
-title(sprintf('RX constellation apres CP-CFO + CP fine timing + FFT | CPoff=%d', bestOffset));
-xlim([-3 3]);
-ylim([-3 3]);
+title('Apres egalisation');
+xlim([-1.5 1.5]);
+ylim([-1.5 1.5]);
+
+
+% Canal 
+figure('Name', 'Canal estime H[k]', 'NumberTitle', 'off');
+
+subplot(2,1,1);
+plot(abs(H_used_final), 'k', 'LineWidth', 1.2);
+grid on;
+xlabel('Indice sous-porteuse utile');
+ylabel('|H[k]|');
+title('Amplitude du canal estime');
+
+subplot(2,1,2);
+plot(angle(H_used_final), 'k', 'LineWidth', 1.2);
+grid on;
+xlabel('Indice sous-porteuse utile');
+ylabel('Phase H[k] (rad)');
+title('Phase du canal estime');
+
+
+
+
+
+
+
 
 
 
@@ -375,7 +391,7 @@ function config = default_ofdm_config()
     config.N_USED  = config.N_FFT - config.N_VC;
     config.N_CP    = config.N_FFT / 4;
     config.N_SYM   = 12;
-    config.N_PREA  = 4;
+    config.N_PREA  = 8;
     config.M_ORDER = 16;
 
     K = config.N_USED / 2;
