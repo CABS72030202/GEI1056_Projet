@@ -3,11 +3,6 @@
 % Chaque machine execute ce meme script, avec un role fixe:
 % - role = 'TX' : emission uniquement
 % - role = 'RX' : reception + traitement uniquement
-%
-% NOTE: la synchronisation inter-PC fine sera ajoutee plus tard.
-% Ici, la synchro manuelle est rendue robuste via:
-% - TX en bursts repetes
-% - RX en surcapture longue
 
 clear; clc; close all;
 
@@ -37,15 +32,26 @@ end
 %% Execution OFDM selon le role
 switch nodeRole
 	case 'TX'
+		% Fixer la graine avant generation des bits: les deux PCs utilisent
+		% la meme sequence PRBS sans echange de donnees (pratique standard BER).
+		rng(config.dataSeed);
 		txContext = module_tx(config);
 		transmit_only(radio, txContext, config);
 
 	case 'RX'
-		% On reconstruit localement le contexte TX attendu pour reutiliser
-		% les fonctions de synchro/egalisation/decode deja existantes.
+		% Capturer les echantillons bruts — RX ne connait pas encore les donnees.
+		rawRxSamples = receive_only(radio, config);
+
+		% Correction SFO: utilise uniquement le preambule deterministe (config),
+		% aucune connaissance des bits TX n'est necessaire ici.
+		correctedSamples = estimate_and_correct_sfo(rawRxSamples, config);
+
+		% Reconstruire la reference TX avec la meme graine PRBS que le TX.
+		% Le RX ne recoit pas ces bits: il les regenere independamment
+		% grace a la graine commune, comme tout testeur de BER.
+		rng(config.dataSeed);
 		txContext = module_tx(config);
-		rawRxSamples = receive_only(radio, txContext, config);
-		rxContext = module_rx(rawRxSamples, config, txContext); %#ok<NASGU>
+		rxContext = module_rx(correctedSamples, config, txContext); %#ok<NASGU>
 end
 
 %% -----------------------------------------------------------------------
@@ -58,8 +64,11 @@ function config = default_ofdm_config()
 	% Constante de role pour cette machine: 'TX' ou 'RX'.
 	config.nodeRole = 'TX';
 
-	% Optionnel: serials dedies par role.
-	% Laisser vide ('') pour ouverture automatique.
+	% Graine PRBS commune aux deux PCs pour la generation des bits de test.
+	% Modifier cette valeur pour changer la sequence, mais elle doit etre
+	% identique sur les deux machines.
+	config.dataSeed = 42;
+
 	config.txSerial = '';
 	config.rxSerial = '';
 
@@ -154,8 +163,10 @@ function transmit_only(radio, txContext, config)
 end
 
 
-function rawSamples = receive_only(radio, txContext, config)
+function rawSamples = receive_only(radio, config)
 % Reception seule (role RX), puis retour des echantillons bruts.
+% Ne depend d'aucune donnee TX: longueur de capture basee uniquement
+% sur les parametres OFDM et la duree de surcapture configuree.
 
 	rawSamples = [];
 	if isempty(radio)
@@ -170,10 +181,12 @@ function rawSamples = receive_only(radio, txContext, config)
 	radio.rx.bandwidth         = config.bandwidthHz;
 	radio.rx.config.timeout_ms = config.streamTimeoutMs;
 
-	tx_len   = numel(txContext.txBuffer);
+	% Longueur de capture derivee des parametres OFDM (pas du buffer TX).
+	sym_len         = config.N_FFT + config.N_CP;
+	one_burst_len   = config.N_PREA * sym_len + config.N_SYM * sym_len + ...
+	                  2 * round(double(config.txZeroPadMs) * fs / 1000);
 	raw_capture_len = round(double(config.rxCaptureDurationMs) * fs / 1000);
-	based_capture_len = tx_len + round(config.rxPrerollMs  * fs / 1000) + round(config.rxPostrollMs * fs / 1000);
-	rx_len   = max(raw_capture_len, based_capture_len);
+	rx_len          = max(raw_capture_len, one_burst_len);
 
 	leadSamples = round(config.syncLeadTimeMs * fs / 1000);
 	rx_ts = uint64(max(0, double(radio.rx.timestamp) + leadSamples));
@@ -191,6 +204,131 @@ function rawSamples = receive_only(radio, txContext, config)
 	fprintf('module_ofdm_double[RX]: %d echantillons captures (ts=%u).\n', numel(rawSamples), ts_out);
 	if overrun
 		warning('module_ofdm_double:rxOverrun', 'Overrun detecte pendant la capture RX.');
+	end
+end
+
+
+function correctedSamples = estimate_and_correct_sfo(rawSamples, config)
+% Estimer et corriger le SFO (Sample Frequency Offset) entre les deux bladeRF.
+%
+% Le preambule de reference est reconstruit ici depuis config uniquement:
+% sa structure est entierement deterministe (pas de bits aleatoires),
+% donc RX peut le generer independamment sans connaitre les donnees TX.
+%
+% Principe:
+%   1) Correlater le preambule de reference sur la surcapture pour trouver
+%      les pics correspondant aux differents bursts TX.
+%   2) Comparer l'espacement mesure entre deux pics avec l'espacement nominal
+%      attendu (burst_period_samples) -> donne epsilon en ppm.
+%   3) Reechantillonner le flux RX avec resample(x, p, q) pour compenser.
+%      ratio = 1/(1+epsilon), approxime en fraction rationnelle p/q.
+%   4) Le flux corrige a la bonne cadence d'echantillonnage nominale;
+%      module_rx peut alors s'en servir normalement.
+
+	correctedSamples = rawSamples;  % par defaut, pas de correction
+
+	if isempty(rawSamples)
+		warning('module_ofdm_double:sfo', 'Donnees insuffisantes pour estimer le SFO.');
+		return;
+	end
+
+	% --- 1) Correlation preambule pour detecter les pics de bursts ---
+	% Le preambule est deterministe: RX peut le reconstruire sans connaitre
+	% les bits TX. Aucune information de la couche donnees n'est utilisee ici.
+	pre = build_preamble_ref(config);
+	raw = rawSamples(:);
+	corr = abs(conv(raw, conj(flipud(pre)), 'valid'));
+
+	% Normaliser pour avoir un seuil independant du niveau de puissance.
+	corr_norm = corr / (max(corr) + eps);
+
+	% L'espacement attendu entre bursts en echantillons (d'apres la config TX).
+	fs = config.sampleRateHz;
+	sym_len       = config.N_FFT + config.N_CP;
+	one_burst_len = config.N_PREA * sym_len + config.N_SYM * sym_len + ...
+	                2 * round(double(config.txZeroPadMs) * fs / 1000);
+	period_samples = max( ...
+		round(double(config.txBurstPeriodMs) * fs / 1000), ...
+		one_burst_len + round(0.001 * fs));
+
+	% Trouver les pics avec une zone d'exclusion = period/2 autour de chaque pic.
+	exclude = max(1, round(period_samples / 2));
+	peaks_idx = [];
+	corr_copy = corr_norm;
+	threshold = 0.3;
+	for attempt = 1:config.txBurstCount
+		[peak_val, peak_pos] = max(corr_copy);
+		if peak_val < threshold, break; end
+		peaks_idx(end+1) = peak_pos; %#ok<AGROW>
+		% Exclure le voisinage de ce pic pour le prochain tour.
+		i_lo = max(1, peak_pos - exclude);
+		i_hi = min(numel(corr_copy), peak_pos + exclude);
+		corr_copy(i_lo:i_hi) = 0;
+	end
+
+	if numel(peaks_idx) < 2
+		warning('module_ofdm_double:sfo', ...
+			'Moins de 2 pics detectes (%d): SFO non corrige.', numel(peaks_idx));
+		return;
+	end
+
+	% --- 2) Estimation de l'epsilon SFO ---
+	% Utiliser le premier et le dernier pic pour maximiser la resolution.
+	peaks_sorted = sort(peaks_idx);
+	pos1 = peaks_sorted(1);
+	pos2 = peaks_sorted(end);
+	n_gaps = peaks_sorted(end) - peaks_sorted(1);	% peut couvrir plusieurs periodes
+	n_periods = round(n_gaps / period_samples);
+
+	if n_periods < 1
+		warning('module_ofdm_double:sfo', 'Pics trop proches pour estimer le SFO.');
+		return;
+	end
+
+	measured_period = (pos2 - pos1) / n_periods;
+	epsilon = (measured_period - period_samples) / period_samples;
+	epsilon_ppm = epsilon * 1e6;
+
+	fprintf(['module_ofdm_double[RX]: SFO estime = %.2f ppm ' ...
+		'(pos1=%d, pos2=%d, n_periods=%d).\n'], epsilon_ppm, pos1, pos2, n_periods);
+
+	if abs(epsilon_ppm) < 0.1
+		fprintf('module_ofdm_double[RX]: SFO negligeable, pas de resampling.\n');
+		return;
+	end
+
+	% --- 3) Resampling pour compenser la derive d'horloge ---
+	% On veut que le RX ait la meme cadence que le TX:
+	%   ratio = f_s_TX / f_s_RX = 1 / (1 + epsilon)
+	% resample(x, p, q) produit p/q echantillons par echantillon d'entree.
+	N_rat = 10000;
+	p_rat = N_rat;
+	q_rat = round(N_rat * (1 + epsilon));
+	if q_rat < 1, q_rat = 1; end
+
+	correctedSamples = resample(raw, p_rat, q_rat);
+	fprintf('module_ofdm_double[RX]: resampling %d/%d applique.\n', p_rat, q_rat);
+end
+
+
+function preamble = build_preamble_ref(config)
+% Reconstruire le preambule de reference depuis la configuration uniquement.
+% Identique a build_tx_preamble dans module_tx, mais disponible cote RX
+% sans avoir besoin du contexte TX ni des bits de donnees.
+
+	preamble_freq_shift = complex(zeros(config.N_FFT, 1));
+	used_bins = mod(config.data_bins_shift, config.N_FFT) + 1;
+	alt = (-1).^(0:numel(used_bins)-1).';
+	preamble_freq_shift(used_bins) = complex(alt, 0);
+
+	preamble_time = ifft(ifftshift(preamble_freq_shift, 1), config.N_FFT, 1);
+	preamble_sym  = [preamble_time(end - config.N_CP + 1:end); preamble_time];
+
+	sign_pattern = repmat([1, -1], 1, ceil(config.N_PREA / 2));
+	sign_pattern = sign_pattern(1:config.N_PREA);
+	preamble = [];
+	for k = 1:config.N_PREA
+		preamble = [preamble; preamble_sym * sign_pattern(k)]; %#ok<AGROW>
 	end
 end
 
