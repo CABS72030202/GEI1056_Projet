@@ -230,22 +230,22 @@ rxPayloadCFO  = rxPayload .* exp(-1j*2*pi*eps_hat*n_cfopayload);
 
 %% RESYNCHRONISATION APRES CFO
 
-rxSamplesCFOcorr = rxSamples .* exp(-1j*2*pi*eps_hat*(0:length(rxSamples)-1).');
-
-rxSamplesDouble_CFO = double(rxSamplesCFOcorr(:));
-
-corrComplex_CFO = conv(rxSamplesDouble_CFO, preambleMatched, 'valid');
-corrMetric_CFO = abs(corrComplex_CFO);
-
-[~, startIndex_CFO] = max(corrMetric_CFO);
-
-fprintf('RX: nouvelle synchro apres CFO = %d\n', startIndex_CFO);
-
-alignedFrameCFO = rxSamplesCFOcorr(startIndex_CFO:end);
-
-% Ré-extraction propre
-rxPreambleCFO = alignedFrameCFO(1:Lpre);
-rxPayloadCFO  = alignedFrameCFO(Lpre+1 : Lpre+length(payload));
+% rxSamplesCFOcorr = rxSamples .* exp(-1j*2*pi*eps_hat*(0:length(rxSamples)-1).');
+% 
+% rxSamplesDouble_CFO = double(rxSamplesCFOcorr(:));
+% 
+% corrComplex_CFO = conv(rxSamplesDouble_CFO, preambleMatched, 'valid');
+% corrMetric_CFO = abs(corrComplex_CFO);
+% 
+% [~, startIndex_CFO] = max(corrMetric_CFO);
+% 
+% fprintf('RX: nouvelle synchro apres CFO = %d\n', startIndex_CFO);
+% 
+% alignedFrameCFO = rxSamplesCFOcorr(startIndex_CFO:end);
+% 
+% % Ré-extraction propre
+% rxPreambleCFO = alignedFrameCFO(1:Lpre);
+% rxPayloadCFO  = alignedFrameCFO(Lpre+1 : Lpre+length(payload));
 
 
 %% Estimation du canal avec preambule
@@ -442,7 +442,7 @@ title('Phase du canal estime');
 %% CONFIG ENVIRONNEMENT 
 function config = default_ofdm_config()
     % Parametres globaux centralises (RF + OFDM + synchronisation).
-    config.bladeRFRoot      = 'C:\Users\yoyol\OneDrive\UQTR-Yohan\1-Systèmes de télécommunications\Projet';
+    config.bladeRFRoot      = 'C:\Program Files\bladeRF';
     config.bladeRFMatlabDir = fullfile(config.bladeRFRoot, 'matlab');
 
     % Parametres RF

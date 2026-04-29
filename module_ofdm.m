@@ -32,7 +32,7 @@ end
 % - module_rx: analyse/affiche les echantillons recus.
 txContext     = module_tx(config);
 rawRxSamples  = synchronize_tx_rx(b, txContext, config);
-rxContext      = module_rx(rawRxSamples, config, txContext); %#ok<NASGU>
+rxContext     = module_rx(rawRxSamples, config, txContext); %#ok<NASGU>
 
 %% Fermeture du bladeRF
 if ~isempty(b)
@@ -56,7 +56,8 @@ function config = default_ofdm_config()
     config.centerFrequencyHz = 2.45e9;
     config.sampleRateHz      = 2.5e6;
     config.bandwidthHz       = 2.5e6;
-    config.txGainDb          = 30;
+    config.txGainDb          = 40;
+    config.rxGainDb          = 40;
     config.syncLeadTimeMs    = 250;  % Marge avant le burst TX (ms)
     config.rxPrerollMs       = 10;   % Capture avant le burst (ms)
     config.rxPostrollMs      = 10;   % Capture apres le burst (ms)
@@ -64,12 +65,13 @@ function config = default_ofdm_config()
 
     % Parametres OFDM
     config.N_FFT   = 64;
-    config.N_VC    = 16;
-    config.N_USED  = config.N_FFT - config.N_VC;
+    config.N_VC    = config.N_FFT / 4;
     config.N_CP    = config.N_FFT / 4;
+    config.N_USED  = config.N_FFT - config.N_VC;
     config.N_SYM   = 12;
     config.N_PREA  = 4;
     config.M_ORDER = 16;
+    config.txZeroPadMs = 5;
 
     K = config.N_USED / 2;
     config.data_bins_shift = [(-K):-1 1:K];

@@ -11,6 +11,7 @@ function txContext = module_tx(config)
 	txContext.symbols = [];
 	txContext.parallelSymbols = [];
 	txContext.frequencyGridShift = [];
+    txContext.zeroPad = [];
     txContext.preamble = [];
 	txContext.timeSignal = [];
 	txContext.txBuffer = [];
@@ -80,8 +81,13 @@ function txContext = build_ofdm_frame(txContext, config)
 
 	txContext.frequencyGridShift = freq_grid_shift;
 
+	% Zero padding avant/apres trame
+	pad_len = round((double(config.txZeroPadMs) / 1000) * double(config.sampleRateHz));
+	txContext.zeroPad = complex(zeros(pad_len, 1));
+
 	fprintf('module_tx: conversion serie-parallele [%d x %d] et mapping sous-porteuses termine.\n', ...
 		size(txContext.parallelSymbols, 1), size(txContext.parallelSymbols, 2));
+	fprintf('module_tx: zero padding configure (%d echantillons de chaque cote).\n', pad_len);
 
 end
 
@@ -96,11 +102,11 @@ function timeSignal = compose_time_domain_signal(txContext, config)
 	x_cp = [x_time(end - config.N_CP + 1:end, :); x_time];
 	payload = x_cp(:);
 
-	timeSignal = [txContext.preamble; payload];
+	timeSignal = [txContext.zeroPad; txContext.preamble; payload; txContext.zeroPad];
 
 	fprintf('module_tx: IFFT + CP termines (%d echantillons payload).\n', numel(payload));
-	fprintf('module_tx: preambule insere (%d echantillons). Trame TX totale: %d echantillons.\n', ...
-		numel(txContext.preamble), numel(timeSignal));
+	fprintf('module_tx: preambule insere (%d echantillons) + zero padding (%d + %d). Trame TX totale: %d echantillons.\n', ...
+		numel(txContext.preamble), numel(txContext.zeroPad), numel(txContext.zeroPad), numel(timeSignal));
 end
 
 
@@ -165,9 +171,22 @@ function visualize_tx_signal(txBuffer, symbols, config)
 		fs = 1;
 	end
 
-	n_plot = min(numel(txBuffer), 2000);
+	% Fenetre utile (entre les deux zero-padding)
+	pad_len = round((double(config.txZeroPadMs) / 1000) * fs);
+	sym_len = double(config.N_FFT + config.N_CP);
+	useful_len = double(config.N_PREA) * sym_len + double(config.N_SYM) * sym_len;
+
+	idx_start = max(1, pad_len + 1);
+	idx_end = min(numel(txBuffer), pad_len + useful_len);
+
+	if idx_end < idx_start
+		idx_start = 1;
+		idx_end = numel(txBuffer);
+	end
+
+	s = double(txBuffer(idx_start:idx_end));
+	n_plot = numel(s);
 	t = (0:n_plot-1).' / fs;
-	s = double(txBuffer(1:n_plot));
 
 	figure('Name', 'TX Signal Visualization', 'NumberTitle', 'off', ...
 		'Position', [10, 80, 500, 900]);
@@ -200,5 +219,6 @@ function visualize_tx_signal(txBuffer, symbols, config)
     xlim([-1 1]);
     ylim([-1 1]);
 
-	fprintf('module_tx: visualisation TX affichee (%d echantillons).\n', n_plot);
+	fprintf('module_tx: visualisation TX affichee entre padding (%d echantillons, indices %d:%d).\n', ...
+		n_plot, idx_start, idx_end);
 end
