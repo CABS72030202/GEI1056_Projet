@@ -9,7 +9,7 @@ function rxContext = module_rx(rawSamples, config, txContext)
 % 4) Estimation et correction CFO
 % 5) Estimation canal + offset CP optimal
 % 6) Egalisation + correction CPE
-% 7) Demodulation et BER
+% 7) Demodulation, BER, EVM et SNR
 
 	rxContext = struct();
 	rxContext.config = config;
@@ -211,9 +211,10 @@ end
 
 function cfoContext = estimate_and_correct_cfo(rxPreamble, rxPayload, config)
 % Estimer le decalage de frequence porteuse (CFO) et corriger le signal.
-% Methode basee sur la redondance du prefixe cyclique (CP): la partie CP
-% est une copie de la fin du symbole, donc leur produit croise donne un
-% dephasage proportionnel au CFO normalise eps = CFO / fs.
+% Methode CP (Moose): le prefixe cyclique est une copie exacte de la fin
+% du symbole OFDM. Leur correlation donne un angle = 2*pi*eps*N_FFT,
+% d'ou eps_hat = angle(...) / (2*pi*N_FFT), avec eps = CFO / fs.
+% La correction est appliquee en multipliant par exp(-j*2*pi*eps_hat*n).
 
 	cfoContext = struct();
 	cfoContext.eps_list = [];
@@ -274,9 +275,11 @@ end
 
 function channelContext = estimate_channel_and_offset(rxPreambleCFO, rxPayloadCFO, config)
 % Estimer la reponse frequentielle du canal H[k] et trouver l'offset CP optimal.
-% L'estimation utilise les moindres carres (LS) sur le preambule connu.
-% L'offset CP est recherche par balayage: on choisit celui qui maximise
-% la coherence des symboles equalises sur tout le payload.
+% Estimation LS: H[k] = Y[k] / X[k], avec X[k] le preambule connu et Y[k]
+% la DFT du signal recu sur les sous-porteuses utiles.
+% L'offset CP optimal est recherche par balayage de 0 a N_CP-1: on retient
+% l'offset qui maximise mean(|mean(Yeq, symboles)|), indicateur de coherence
+% inter-symbole sur le payload equalise.
 
 	channelContext = struct();
 	channelContext.bestOffset = 0;
@@ -352,9 +355,12 @@ end
 
 function eqContext = equalize_payload(rxPayloadCFO, channelContext, config)
 % Effectuer l'egalisation frequentielle du payload OFDM.
-% Pour chaque symbole: correction du CFO residuel via le CP, retrait du CP,
-% FFT, selection des sous-porteuses utiles, puis division par H[k] (egalisation
-% un-tap par sous-porteuse, valide en canal invariant dans la fenetre OFDM).
+% Pour chaque symbole OFDM:
+%   1) Estimation du CFO residuel symbole par symbole via le CP (Moose)
+%   2) Correction en temps: x_corr[n] = x[n] * exp(-j*2*pi*eps_m*n)
+%   3) Retrait du CP selon l'offset optimal, FFT, fftshift
+%   4) Egalisation un-tap: Yeq[k] = Y[k] / H[k] (valide si le canal
+%      est invariant dans la fenetre d'un symbole OFDM)
 
 	eqContext = struct();
 	eqContext.eps_sym = [];
@@ -415,8 +421,9 @@ end
 function cpeContext = apply_cpe_correction(rxEq, txContext)
 % Corriger la derive de phase commune (CPE - Common Phase Error) symbole par symbole.
 % La CPE est une rotation de phase identique sur toutes les sous-porteuses
-% d'un meme symbole OFDM, causee par un oscillateur imprecis.
-% Elle est estimee par comparaison avec les symboles TX de reference.
+% d'un meme symbole OFDM, causee par du bruit de phase ou un CFO residuel.
+% Estimation: theta[m] = angle(sum(Z[:,m] .* conj(Xref[:,m])))
+% Correction:  Z_corr[:,m] = Z[:,m] .* exp(-j*theta[m])
 
 	cpeContext = struct();
 	cpeContext.theta_hat = [];
@@ -455,9 +462,7 @@ end
 
 
 function demodContext = demodulate_and_compute_ber(rxQAM, txContext, config)
-% Demoduler les symboles QAM recus et calculer le taux d'erreur binaire (BER).
-% La demodulation utilise le codage Gray et une puissance moyenne normalisee.
-% Le BER est calcule par comparaison directe avec les bits transmis si disponibles.
+% Demoduler les symboles QAM recus et calculer BER, EVM et SNR.
 
 	demodContext = struct();
 	demodContext.rxInts = [];
@@ -466,6 +471,12 @@ function demodContext = demodulate_and_compute_ber(rxQAM, txContext, config)
 	demodContext.bitErrors = NaN;
 	demodContext.BER = NaN;
 	demodContext.hasReference = false;
+	demodContext.evmRms = NaN;
+	demodContext.evmPercent = NaN;
+	demodContext.evmDb = NaN;
+	demodContext.snrDb = NaN;
+	demodContext.nSymbolsCompared = 0;
+	demodContext.alpha = NaN;
 
 	if isempty(rxQAM)
 		warning('module_rx:demod', 'Signal RX vide: demodulation impossible.');
@@ -500,79 +511,47 @@ function demodContext = demodulate_and_compute_ber(rxQAM, txContext, config)
 	else
 		warning('module_rx:ber', 'Bits TX indisponibles: BER non calcule.');
 	end
-end
 
+	% EVM et SNR: alignement par alpha avant mesure de l'erreur vectorielle.
+	if isfield(txContext, 'symbols') && ~isempty(txContext.symbols)
+		txSyms = txContext.symbols(:);
+		rxSyms = rxQAM(:);
+		nSymCompare = min(numel(txSyms), numel(rxSyms));
 
-function visualize_rx_signal(rxBuffer, config)
-% Afficher le signal RX brut: composantes I/Q, enveloppe et constellation.
-% La fenetre d'affichage est automatiquement centree sur la zone du burst
-% en utilisant une energie glissante, afin d'eviter d'afficher les plages
-% de silence en debut et fin de capture.
+		if nSymCompare > 0
+			txRef = txSyms(1:nSymCompare);
+			rxRef = rxSyms(1:nSymCompare);
 
-	if isempty(rxBuffer)
-		warning('module_rx: aucun echantillon RX a visualiser.');
-		return;
-	end
+			alpha = sum(conj(txRef) .* rxRef) / (sum(abs(txRef).^2) + 1e-12);
+			rxAligned = rxRef / (alpha + 1e-12);
+			err = rxAligned - txRef;
 
-	if isfield(config, 'sampleRateHz') && config.sampleRateHz > 0
-		fs = double(config.sampleRateHz);
+			sigPow = mean(abs(txRef).^2);
+			errPow = mean(abs(err).^2);
+
+			evmRms = sqrt(errPow / (sigPow + 1e-12));
+			evmDb = 20 * log10(evmRms + 1e-12);
+			snrDb = 10 * log10((sigPow + 1e-12) / (errPow + 1e-12));
+
+			demodContext.evmRms = evmRms;
+			demodContext.evmPercent = 100 * evmRms;
+			demodContext.evmDb = evmDb;
+			demodContext.snrDb = snrDb;
+			demodContext.nSymbolsCompared = nSymCompare;
+			demodContext.alpha = alpha;
+
+			fprintf('\n===== RESULTATS EVM / SNR =====\n');
+			fprintf('Symboles compares = %d\n', nSymCompare);
+			fprintf('alpha             = %.4f%+.4fj\n', real(alpha), imag(alpha));
+			fprintf('EVM_rms           = %.4f\n', evmRms);
+			fprintf('EVM               = %.2f %%\n', 100 * evmRms);
+			fprintf('EVM(dB)           = %.2f dB\n', evmDb);
+			fprintf('SNR estime        = %.2f dB\n', snrDb);
+		end
 	else
-		fs = 1;
+		warning('module_rx:evm', 'Symboles TX indisponibles: EVM/SNR non calcules.');
 	end
-
-	n_total = numel(rxBuffer);
-	n_plot = min(n_total, 2000);
-
-	% Localiser la zone du burst par filtrage de l'energie instantanee.
-	win = min(256, floor(n_total / 4));
-	energy = filter(ones(win, 1) / win, 1, abs(double(rxBuffer(:))).^2);
-	[~, peak_idx] = max(energy);
-	burst_center = max(1, peak_idx - win);
-	plot_start = max(1, burst_center - floor(n_plot / 4));
-	plot_end   = min(n_total, plot_start + n_plot - 1);
-	plot_start = max(1, plot_end - n_plot + 1);
-
-	fprintf('module_rx: affichage centre sur le burst (echantillons %d a %d).\n', plot_start, plot_end);
-
-	t = (plot_start-1 : plot_end-1).' / fs;
-	s = double(rxBuffer(plot_start:plot_end));
-
-	figure('Name', 'RX Signal Visualization', 'NumberTitle', 'off', ...
-		'Position', [530, 80, 500, 900]);
-	tl = tiledlayout(4, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
-
-	nexttile(tl);
-	plot(t, real(s), 'b', t, imag(s), 'r');
-	grid on;
-	xlabel('Temps (s)');
-	ylabel('Amplitude');
-	legend('I', 'Q');
-	title('Signal RX (I/Q)');
-    ylim([-1 1]);
-
-	nexttile(tl);
-	plot(t, abs(s), 'k');
-	grid on;
-	xlabel('Temps (s)');
-	ylabel('|s(t)|');
-	title('Enveloppe du signal RX');
-    ylim([0 1]);
-
-	ax_const = nexttile(tl, [2 1]); %#ok<NASGU>
-	const_start = max(1, burst_center);
-	const_end   = min(n_total, const_start + 2999);
-	scatter(real(rxBuffer(const_start:const_end)), imag(rxBuffer(const_start:const_end)), 10, 'filled','MarkerFaceAlpha', 0.35);
-	title('Constellation RX');
-	grid on;
-	axis equal;
-	xlabel('In-phase (I)');
-	ylabel('Quadrature (Q)');
-	xlim([-1 1]);
-	ylim([-1 1]);
-
-	fprintf('module_rx: visualisation RX affichee (%d echantillons autour du burst).\n', plot_end - plot_start + 1);
 end
-
 
 function visualize_rx_post_equalization(Y_used, rxQAM, H_used_final)
 % Afficher les constellations avant et apres egalisation, ainsi que le canal estime.
@@ -831,17 +810,20 @@ end
 
 
 function used_bins = get_used_bins(config)
-% Convertir les indices de sous-porteuses (centrees sur 0) en indices MATLAB
-% (base 1) apres fftshift, pour selectionner les sous-porteuses utiles.
+% Convertir les indices de sous-porteuses en convention centree (DC=0)
+% vers les indices MATLAB (base 1) correspondant a la sortie de fftshift.
+% Exemple: indice -1 avec N_FFT=64 -> mod(-1,64)+1 = 64.
 
 	used_bins = mod(config.data_bins_shift, config.N_FFT) + 1;
 end
 
 
 function [preamble_freq_shift, sign_pattern] = build_preamble_reference(config, nPrea)
-% Reconstruire la reference frequentielle du preambule tel qu'il a ete emis.
-% Retourne le vecteur frequentiel fftshift du preambule (BPSK alterne)
-% et le pattern de signe +/- utilise pour chaque repetition.
+% Reconstruire la reference frequentielle du preambule cote RX.
+% Le preambule TX est un symbole BPSK a alternance de signe (+1/-1) sur
+% les sous-porteuses utiles; chaque repetition est multipliee par +1 ou -1
+% alternativement. Cette fonction retourne le vecteur fftshift correspondant
+% et le vecteur de signes, necessaires pour l''estimation LS du canal.
 
 	preamble_freq_shift = complex(zeros(config.N_FFT, 1));
 	used_bins = get_used_bins(config);
