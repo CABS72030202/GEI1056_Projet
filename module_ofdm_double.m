@@ -62,7 +62,7 @@ function config = default_ofdm_config()
 	config.bladeRFMatlabDir = fullfile(config.bladeRFRoot, 'matlab');
 
 	% Constante de role pour cette machine: 'TX' ou 'RX'.
-	config.nodeRole = 'TX';
+	config.nodeRole = 'RX';
 
 	% Graine PRBS commune aux deux PCs pour la generation des bits de test.
 	% Modifier cette valeur pour changer la sequence, mais elle doit etre

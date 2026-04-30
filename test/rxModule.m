@@ -32,7 +32,8 @@ centerFrequencyHz = 2.45e9;
 bandwidthHz = 2.5e6;
 txGainDb = 40;
 rxGainDb = 40;
-streamTimeoutMs = 5000
+streamTimeoutMs = 20000;
+sym_len = N_FFT + N_CP;
 
 b = configure_bladerf(b, sampleRateHz, centerFrequencyHz, bandwidthHz, txGainDb, rxGainDb, streamTimeoutMs);
 K = N_USED/2;
@@ -76,15 +77,17 @@ end
 %% ============================================================
 
 % Capture
-captureTimeSec = 1;   
+captureTimeSec = 1.5;   
 rx_len = round(captureTimeSec * sampleRateHz);
 
-fprintf('\nRX: capture de %d echantillons (%.3f ms)\n', rx_len, captureTimeSec);
+fprintf('\nRX: capture de %d echantillons (%.3f s)\n', rx_len, captureTimeSec);
 
 % Acquisition des données
+fprintf('\nRX: Debut de la lecture\n');
 b.rx.start();
 [rawSamples, ts_out, actual_count, overrun] = b.receive(rx_len, streamTimeoutMs);
 b.rx.stop();
+fprintf('\nRX: Fin de la lecture\n');
 
 rawSamples = rawSamples(:);
 
@@ -102,7 +105,7 @@ end
 rxSamples = rawSamples;
 
 
-
+delete(b);
 
 %% ============================================================
 %  Synchronisation et STO
@@ -140,6 +143,7 @@ alignedFrame = rxSamples(startIndex:end);
 
 % 5) Extraction propre des données
 Lpre = length(preamble);
+payload_len_expected = N_SYM * sym_len;
 payload_start = startIndex + Lpre;
 payload_end   = payload_start + payload_len_expected - 1;
 if payload_end > length(rxSamples)
@@ -152,8 +156,6 @@ rxPayload  = rxSamples(payload_start : payload_end);
 %% ============================================================
 %  CFO
 %% ============================================================
-
-sym_len = N_FFT + N_CP;
 payload_len_expected = N_SYM * sym_len;
 rxPayload_forCFO = rxPayload(1:payload_len_expected);
 rxSymsCP = reshape(rxPayload_forCFO, sym_len, N_SYM);
@@ -331,19 +333,176 @@ fprintf('BER           = %.3e\n', BER);
 % AFFICHAGE
 %% ============================================================
 
-%IQ
-figure(1);
-scatter(real(rxQAM), imag(rxQAM), 10, 'filled','MarkerFaceAlpha', 0.35);
+
+
+fs = sampleRateHz;
+
+% Longueur de la trame utile détectée
+frameLength = length(preamble) + payload_len_expected;
+
+rxBefore = rawSamples(:);
+rxAfter  = alignedFrame(:);
+
+% Même logique que ton ancien code : avant = capture depuis le début,
+% après = trame alignée à partir du préambule
+nBefore = min(length(rxBefore), frameLength + startIndex - 1);
+nAfter  = min(length(rxAfter), frameLength);
+
+sBefore = double(rxBefore(1:nBefore));
+sAfter  = double(rxAfter(1:nAfter));
+
+tBefore = (0:nBefore-1).' / fs;
+tAfter  = (0:nAfter-1).' / fs;
+
+%% 1) Corrélation du préambule
+
+figure('Name', 'RX - Detection preambule', 'NumberTitle', 'off');
+
+plot(corrMetric, 'k');
+hold on;
+plot(startIndex, peakValue, 'ro', 'MarkerSize', 8, 'LineWidth', 1.5);
+grid on;
+xlabel('Indice de correlation');
+ylabel('|Correlation|');
+title('Detection du preambule par correlation');
+legend('Correlation', 'Pic detecte');
+
+%% 2) Comparaison avant/apres alignement STO
+
+figure('Name', 'Comparaison RX avant/apres alignement STO', ...
+       'NumberTitle', 'off', ...
+       'Position', [100, 80, 900, 700]);
+
+tl = tiledlayout(3, 2, 'TileSpacing', 'compact', 'Padding', 'compact');
+
+% I/Q avant alignement
+nexttile(tl);
+plot(tBefore, real(sBefore), 'b', tBefore, imag(sBefore), 'r');
+grid on;
+xlabel('Temps (s)');
+ylabel('Amplitude');
+title('Avant alignement - I/Q');
+legend('I','Q');
+ylim([-1 1]);
+xline((startIndex-1)/fs, '--k', 'Debut detecte');
+
+% I/Q apres alignement
+nexttile(tl);
+plot(tAfter, real(sAfter), 'b', tAfter, imag(sAfter), 'r');
+grid on;
+xlabel('Temps depuis alignement (s)');
+ylabel('Amplitude');
+title('Apres alignement - I/Q');
+legend('I','Q');
+ylim([-1 1]);
+
+% Enveloppe avant alignement
+nexttile(tl);
+plot(tBefore, abs(sBefore), 'k');
+grid on;
+xlabel('Temps (s)');
+ylabel('|s(t)|');
+title('Avant alignement - enveloppe');
+ylim([0 1]);
+xline((startIndex-1)/fs, '--r', 'Debut detecte');
+
+% Enveloppe apres alignement
+nexttile(tl);
+plot(tAfter, abs(sAfter), 'k');
+grid on;
+xlabel('Temps depuis alignement (s)');
+ylabel('|s(t)|');
+title('Apres alignement - enveloppe');
+ylim([0 1]);
+
+% Constellation brute avant alignement
+nexttile(tl);
+scatter(real(sBefore), imag(sBefore), 8, 'filled', ...
+    'MarkerFaceAlpha', 0.25);
+grid on;
+axis equal;
+xlim([-1 1]);
+ylim([-1 1]);
+xlabel('I');
+ylabel('Q');
+title('Avant alignement - constellation brute');
+
+% Constellation brute apres alignement
+nexttile(tl);
+scatter(real(sAfter), imag(sAfter), 8, 'filled', ...
+    'MarkerFaceAlpha', 0.25);
+grid on;
+axis equal;
+xlim([-1 1]);
+ylim([-1 1]);
+xlabel('I');
+ylabel('Q');
+title('Apres alignement - constellation brute');
+
+fprintf('RX: comparaison avant/apres alignement affichee.\n');
+
+%% 3) Affichage apres correction CFO
+
+rxAfterCFO = rxPayloadCFO(:);
+
+nAfterCFO = min(length(rxAfterCFO), payload_len_expected);
+
+sAfterCFO = double(rxAfterCFO(1:nAfterCFO));
+tAfterCFO = (0:nAfterCFO-1).' / fs;
+
+figure('Name', 'RX apres correction CFO', ...
+       'NumberTitle', 'off', ...
+       'Position', [650, 80, 500, 900]);
+
+tl = tiledlayout(3, 1, 'TileSpacing', 'compact', 'Padding', 'compact');
+
+nexttile(tl);
+plot(tAfterCFO, real(sAfterCFO), 'b', ...
+     tAfterCFO, imag(sAfterCFO), 'r');
+grid on;
+xlabel('Temps depuis debut payload (s)');
+ylabel('Amplitude');
+legend('I', 'Q');
+title(sprintf('RX apres correction CFO - I/Q | CFO = %.2f Hz', CFO_Hz));
+ylim([-1 1]);
+
+nexttile(tl);
+plot(tAfterCFO, abs(sAfterCFO), 'k');
+grid on;
+xlabel('Temps depuis debut payload (s)');
+ylabel('|s(t)|');
+title('RX apres correction CFO - enveloppe');
+ylim([0 1]);
+
+nexttile(tl);
+scatter(real(sAfterCFO), imag(sAfterCFO), 8, 'filled', ...
+    'MarkerFaceAlpha', 0.25);
+grid on;
+axis equal;
+xlim([-1 1]);
+ylim([-1 1]);
+xlabel('I');
+ylabel('Q');
+title('Constellation brute apres correction CFO');
+
+fprintf('RX: visualisation apres correction CFO terminee.\n');
+
+%% 4) Constellation finale apres egalisation + CPE
+
+figure('Name', 'RX constellation finale', 'NumberTitle', 'off');
+
+scatter(real(rxQAM), imag(rxQAM), 10, 'filled', ...
+    'MarkerFaceAlpha', 0.35);
 grid on;
 axis equal;
 xlabel('I');
 ylabel('Q');
-title('Apres egalisation');
+title(sprintf('Constellation finale apres egalisation + CPE | BER = %.3e', BER));
 xlim([-1.5 1.5]);
 ylim([-1.5 1.5]);
 
+%% 5) Canal estime
 
-% Canal 
 figure('Name', 'Canal estime H[k]', 'NumberTitle', 'off');
 
 subplot(2,1,1);
@@ -359,6 +518,309 @@ grid on;
 xlabel('Indice sous-porteuse utile');
 ylabel('Phase H[k] (rad)');
 title('Phase du canal estime');
+
+%% 6) Résumé console
+
+fprintf('\n===== RESUME RX =====\n');
+fprintf('Preambule detecte a        : %d\n', startIndex);
+fprintf('STO estime                 : %d echantillons\n', estimatedSTO);
+fprintf('Pic correlation            : %.4e\n', peakValue);
+fprintf('CFO estime                 : %.2f Hz\n', CFO_Hz);
+fprintf('Best CP offset             : %d\n', bestOffset);
+fprintf('BER                        : %.3e\n', BER);
+fprintf('Erreurs bits               : %d / %d\n', bitErrors, total_bits);
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+% fs = sampleRateHz;
+% 
+% % Longueurs utiles
+% Lpre = length(preamble);
+% payload_len_expected = N_SYM * sym_len;
+% frameLength = Lpre + payload_len_expected;
+% 
+% % Trame complète détectée dans la capture brute
+% frame_start = startIndex;
+% frame_end   = min(length(rxSamples), frame_start + frameLength - 1);
+% 
+% rxFrameDetected = rxSamples(frame_start:frame_end);
+% 
+% t_frame = (0:length(rxFrameDetected)-1).' / fs;
+% 
+% % Axes temporels pour la capture complète
+% t_raw = (0:length(rxSamples)-1).' / fs;
+% 
+% fprintf('\n===== INFORMATIONS DETECTION RX =====\n');
+% fprintf('Indice debut preambule detecte : %d\n', startIndex);
+% fprintf('STO estime                     : %d echantillons\n', estimatedSTO);
+% fprintf('Pic correlation                : %.4e\n', peakValue);
+% fprintf('Longueur preambule             : %d echantillons\n', Lpre);
+% fprintf('Longueur payload attendue      : %d echantillons\n', payload_len_expected);
+% fprintf('Longueur trame utile           : %d echantillons\n', frameLength);
+% fprintf('CFO estime                     : %.2f Hz\n', CFO_Hz);
+% fprintf('Best CP offset                 : %d echantillons\n', bestOffset);
+% fprintf('BER                            : %.3e (%d/%d erreurs)\n', BER, bitErrors, total_bits);
+% 
+% %% Figure 1 : capture brute + position detectee
+% 
+% figure('Name', 'RX - Capture brute et detection de trame', ...
+%        'NumberTitle', 'off');
+% 
+% subplot(3,1,1);
+% plot(t_raw, real(rxSamples), 'b');
+% hold on;
+% plot(t_raw, imag(rxSamples), 'r');
+% xline((startIndex-1)/fs, '--k', 'Debut preambule');
+% xline((payload_start-1)/fs, '--m', 'Debut payload');
+% grid on;
+% xlabel('Temps (s)');
+% ylabel('Amplitude');
+% legend('I', 'Q');
+% title('Capture RX brute avec position detectee');
+% 
+% subplot(3,1,2);
+% plot(t_raw, abs(rxSamples), 'k');
+% xline((startIndex-1)/fs, '--r', 'Debut preambule');
+% xline((payload_start-1)/fs, '--m', 'Debut payload');
+% grid on;
+% xlabel('Temps (s)');
+% ylabel('|r[n]|');
+% title('Enveloppe de la capture RX brute');
+% 
+% subplot(3,1,3);
+% plot(corrMetric, 'k');
+% hold on;
+% plot(startIndex, peakValue, 'ro', 'MarkerSize', 8, 'LineWidth', 1.5);
+% grid on;
+% xlabel('Indice de correlation');
+% ylabel('|Correlation|');
+% title('Detection du preambule par correlation');
+% legend('Correlation', 'Pic detecte');
+% 
+% %% Figure 2 : trame complète détectée
+% 
+% figure('Name', 'RX - Trame complete detectee', ...
+%        'NumberTitle', 'off');
+% 
+% subplot(3,1,1);
+% plot(t_frame, real(rxFrameDetected), 'b');
+% hold on;
+% plot(t_frame, imag(rxFrameDetected), 'r');
+% xline((Lpre)/fs, '--m', 'Fin preambule / debut payload');
+% grid on;
+% xlabel('Temps depuis debut detecte (s)');
+% ylabel('Amplitude');
+% legend('I', 'Q');
+% title('Trame complete detectee : preambule + payload');
+% 
+% subplot(3,1,2);
+% plot(t_frame, abs(rxFrameDetected), 'k');
+% xline((Lpre)/fs, '--m', 'Debut payload');
+% grid on;
+% xlabel('Temps depuis debut detecte (s)');
+% ylabel('|r[n]|');
+% title('Enveloppe de la trame complete detectee');
+% 
+% subplot(3,1,3);
+% scatter(real(rxFrameDetected), imag(rxFrameDetected), 8, 'filled', ...
+%     'MarkerFaceAlpha', 0.25);
+% grid on;
+% axis equal;
+% xlabel('I');
+% ylabel('Q');
+% title('Constellation brute de la trame detectee');
+% xlim([-1.5 1.5]);
+% ylim([-1.5 1.5]);
+% 
+% %% Figure 3 : preambule et payload separes
+% 
+% figure('Name', 'RX - Preambule et payload extraits', ...
+%        'NumberTitle', 'off');
+% 
+% subplot(2,2,1);
+% plot(real(rxPreamble), 'b');
+% hold on;
+% plot(imag(rxPreamble), 'r');
+% grid on;
+% xlabel('Indice echantillon');
+% ylabel('Amplitude');
+% title('Preambule extrait - I/Q');
+% legend('I', 'Q');
+% 
+% subplot(2,2,2);
+% plot(abs(rxPreamble), 'k');
+% grid on;
+% xlabel('Indice echantillon');
+% ylabel('|r[n]|');
+% title('Preambule extrait - enveloppe');
+% 
+% subplot(2,2,3);
+% plot(real(rxPayload), 'b');
+% hold on;
+% plot(imag(rxPayload), 'r');
+% grid on;
+% xlabel('Indice echantillon');
+% ylabel('Amplitude');
+% title('Payload extrait - I/Q');
+% legend('I', 'Q');
+% 
+% subplot(2,2,4);
+% plot(abs(rxPayload), 'k');
+% grid on;
+% xlabel('Indice echantillon');
+% ylabel('|r[n]|');
+% title('Payload extrait - enveloppe');
+% 
+% %% Figure 4 : constellation finale apres egalisation + CPE
+% 
+% figure('Name', 'RX - Constellation finale', ...
+%        'NumberTitle', 'off');
+% 
+% scatter(real(rxQAM), imag(rxQAM), 10, 'filled', ...
+%     'MarkerFaceAlpha', 0.35);
+% 
+% grid on;
+% axis equal;
+% xlabel('I');
+% ylabel('Q');
+% title(sprintf('Constellation RX finale | BER = %.3e', BER));
+% xlim([-1.5 1.5]);
+% ylim([-1.5 1.5]);
+% 
+% %% Figure 5 : canal estime
+% 
+% figure('Name', 'RX - Canal estime H[k]', ...
+%        'NumberTitle', 'off');
+% 
+% subplot(2,1,1);
+% plot(abs(H_used_final), 'k', 'LineWidth', 1.2);
+% grid on;
+% xlabel('Indice sous-porteuse utile');
+% ylabel('|H[k]|');
+% title('Amplitude du canal estime');
+% 
+% subplot(2,1,2);
+% plot(angle(H_used_final), 'k', 'LineWidth', 1.2);
+% grid on;
+% xlabel('Indice sous-porteuse utile');
+% ylabel('Phase H[k] (rad)');
+% title('Phase du canal estime');
+% 
+% %% Figure 6 : metrique du CP fine timing
+% 
+% figure('Name', 'RX - CP fine timing sweep', ...
+%        'NumberTitle', 'off');
+% 
+% stem(0:N_CP-1, metrics, 'filled');
+% hold on;
+% plot(bestOffset, metrics(bestOffset+1), 'ro', 'MarkerSize', 8, 'LineWidth', 1.5);
+% grid on;
+% xlabel('Offset dans le CP');
+% ylabel('Metrique');
+% title(sprintf('Recherche du meilleur offset CP | bestOffset = %d', bestOffset));
+% legend('Metrique', 'Meilleur offset');
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+% % Correlation
+% figure('Name', 'RX - Detection preambule', 'NumberTitle', 'off');
+% plot(corrMetric, 'k');
+% grid on;
+% xlabel('Indice de correlation');
+% ylabel('|Correlation|');
+% title('Detection du preambule par correlation');
+% 
+% % 6) Comparaison RX avant et apres alignement STO
+% fs = sampleRateHz;
+% frameLength = length(preamble) + length(payload);
+% rxBefore = rawSamples(:);
+% rxAfter  = alignedFrame(:);
+% % Meme longueur affichee pour comparer proprement
+% nBefore = min(length(rxBefore), frameLength + startIndex - 1);
+% nAfter  = min(length(rxAfter), frameLength);
+% 
+% sBefore = double(rxBefore(1:nBefore));
+% sAfter  = double(rxAfter(1:nAfter));
+% 
+% tBefore = (0:nBefore-1).' / fs;
+% tAfter  = (0:nAfter-1).' / fs;
+% 
+% % I/Q avant Correlation
+% plot(tBefore, real(sBefore), 'b', tBefore, imag(sBefore), 'r');
+% grid on;
+% xlabel('Temps (s)');
+% ylabel('Amplitude');
+% title('Avant alignement - I/Q');
+% legend('I','Q');
+% ylim([-1 1]);
+% xline((startIndex-1)/fs, '--k', 'Début détecté');
+% 
+% % I/Q apres Correlation
+% plot(tAfter, real(sAfter), 'b', tAfter, imag(sAfter), 'r');
+% grid on;
+% xlabel('Temps depuis alignement (s)');
+% ylabel('Amplitude');
+% title('Après alignement - I/Q');
+% legend('I','Q');
+% ylim([-1 1]);
+% 
+% %IQ final
+% figure(1);
+% scatter(real(rxQAM), imag(rxQAM), 10, 'filled','MarkerFaceAlpha', 0.35);
+% grid on;
+% axis equal;
+% xlabel('I');
+% ylabel('Q');
+% title('Apres egalisation');
+% xlim([-1.5 1.5]);
+% ylim([-1.5 1.5]);
+% 
+% 
+% % Canal 
+% figure('Name', 'Canal estime H[k]', 'NumberTitle', 'off');
+% 
+% subplot(2,1,1);
+% plot(abs(H_used_final), 'k', 'LineWidth', 1.2);
+% grid on;
+% xlabel('Indice sous-porteuse utile');
+% ylabel('|H[k]|');
+% title('Amplitude du canal estime');
+% 
+% subplot(2,1,2);
+% plot(angle(H_used_final), 'k', 'LineWidth', 1.2);
+% grid on;
+% xlabel('Indice sous-porteuse utile');
+% ylabel('Phase H[k] (rad)');
+% title('Phase du canal estime');
 
 
 
@@ -411,10 +873,13 @@ function b = configure_bladerf(b, sampleRateHz, centerFrequencyHz, bandwidthHz, 
     b.tx.bandwidth  = bandwidthHz;
 
     b.tx.gain = txGainDb;
+    b.rx.agc = 'manual';
     b.rx.gain = rxGainDb;
 
     b.rx.config.timeout_ms = streamTimeoutMs;
     b.tx.config.timeout_ms = streamTimeoutMs;
+
+    
 
     fprintf('BladeRF configure:\n');
     fprintf('  Frequence centrale : %.3f GHz\n', centerFrequencyHz/1e9);

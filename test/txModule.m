@@ -130,23 +130,26 @@ end
 %% ============================================================
 %  ENVOIE BLADE RF
 %% ============================================================
-% Pour répéter le symbole si on a un prob (changer tx_len par txStreram)
-% N_REP = 20;
-% txStream = repmat(txBuffer(:), N_REP, 1);
+N_REP = 20;   % nombre de répétitions de la trame
+
+txStream = repmat(txBuffer(:), N_REP, 1);
 
 tx_len = numel(txBuffer);
-fprintf('TX: longueur du buffer = %d echantillons.\n', tx_len);
-fprintf('TX: duree approx = %.3f ms.\n', 1000 * tx_len / sampleRateHz);
+tx_stream_len = numel(txStream);
 
-% Demarrer le module TX
+fprintf('TX: longueur dune trame = %d echantillons.\n', tx_len);
+fprintf('TX: nombre de repetitions = %d.\n', N_REP);
+fprintf('TX: longueur totale envoyee = %d echantillons.\n', tx_stream_len);
+fprintf('TX: duree approx dune trame = %.3f ms.\n', 1000 * tx_len / sampleRateHz);
+fprintf('TX: duree approx totale = %.3f ms.\n', 1000 * tx_stream_len / sampleRateHz);
+
 b.tx.start();
 
-% Envoyer la trame
-fprintf('TX: transmission en cours...\n');
-b.transmit(double(txBuffer(:)), streamTimeoutMs);
+fprintf('TX: transmission repetee en cours...\n');
+b.transmit(double(txStream(:)), streamTimeoutMs);
 fprintf('TX: transmission terminee.\n');
-b.tx.stop();
 
+b.tx.stop();
 
 
 %% CONFIG ENVIRONNEMENT 
