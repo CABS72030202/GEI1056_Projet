@@ -32,7 +32,7 @@ centerFrequencyHz = 2.45e9;
 bandwidthHz = 2.5e6;
 txGainDb = 40;
 rxGainDb = 40;
-streamTimeoutMs = 20000;
+streamTimeoutMs = 5000;
 sym_len = N_FFT + N_CP;
 
 b = configure_bladerf(b, sampleRateHz, centerFrequencyHz, bandwidthHz, txGainDb, rxGainDb, streamTimeoutMs);
@@ -77,7 +77,7 @@ end
 %% ============================================================
 
 % Capture
-captureTimeSec = 1;   
+captureTimeSec = 0.001;   
 rx_len = round(captureTimeSec * sampleRateHz);
 
 fprintf('\nRX: capture de %d echantillons (%.3f s)\n', rx_len, captureTimeSec);

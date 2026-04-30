@@ -130,7 +130,7 @@ end
 %% ============================================================
 %  ENVOIE BLADE RF
 %% ============================================================
-N_REP = 500;   % nombre de répétitions de la trame
+N_REP = 10;   % nombre de répétitions de la trame
 
 txStream = repmat(txBuffer(:), N_REP, 1);
 
