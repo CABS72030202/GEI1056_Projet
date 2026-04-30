@@ -34,6 +34,7 @@ La chaîne inclut :
 ```
 GEI1056_Projet/
 ├── double_bladeRF/          # Test RF câblé avec deux BladeRF (TX sur un PC, RX sur l'autre)
+│   ├── demo.mp4             # Vidéo de démonstration du lien TX/RX entre deux BladeRF
 │   ├── txModule.m           # Émetteur : génère et transmet la trame OFDM via BladeRF
 │   └── rxModule.m           # Récepteur : capture et décode la trame OFDM via BladeRF
 │
@@ -109,6 +110,14 @@ sim
 ```
 
 Génère les courbes BER vs SNR de référence en canal AWGN, sans BladeRF.
+
+---
+
+## Démonstration vidéo
+
+Une vidéo de démonstration du fonctionnement de la transmission entre deux BladeRF est disponible ici :
+
+[double_bladeRF/demo.mp4](double_bladeRF/demo.mp4)
 
 ---
 
