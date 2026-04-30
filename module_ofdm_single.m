@@ -80,6 +80,9 @@ function config = default_ofdm_config()
     % N_SYM  : nombre de symboles OFDM dans le payload
     % N_PREA : nombre de repetitions du symbole de preambule
     % M_ORDER: ordre de la modulation QAM (ex: 16 pour 16-QAM)
+    % clippingRatio: ratio de clipping CR = A/RMS
+    % txZeroPadMs  : duree de silence (ms) ajoutee avant/apres la trame TX
+    % data_bins_shift: indices des sous-porteuses actives en convention fftshift
     config.N_FFT   = 64;
     config.N_VC    = config.N_FFT / 4;
     config.N_CP    = config.N_FFT / 4;
@@ -87,8 +90,10 @@ function config = default_ofdm_config()
     config.N_SYM   = 12;
     config.N_PREA  = 4;
     config.M_ORDER = 16;
+    config.clippingRatio = 1.8;
     config.txZeroPadMs = 5;
 
+    % Demi-largeur des sous-porteuses utiles autour du DC (DC exclu).
     K = config.N_USED / 2;
     config.data_bins_shift = [(-K):-1 1:K];
 end

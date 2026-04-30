@@ -18,6 +18,7 @@ function txContext = module_tx(config)
     txContext.preamble = [];
 	txContext.timeSignal = [];
 	txContext.txBuffer = [];
+	txContext.papr_db = [];
 
 	% 1) Generer les bits d'information a transmettre.
 	txContext.bits = generate_tx_bits(config);
@@ -32,10 +33,13 @@ function txContext = module_tx(config)
 	% 4) Convertir la grille OFDM en signal temporel (IFFT + prefixe cyclique).
 	txContext.timeSignal = compose_time_domain_signal(txContext, config);
 
-	% 5) Normaliser le signal et le convertir au format attendu par la radio.
+	% 5) Calculer le PAPR du payload et appliquer le clipping si active.
+	[txContext.papr_db, txContext.timeSignal] = apply_papr_clipping(txContext, config);
+
+	% 6) Normaliser le signal et le convertir au format attendu par la radio.
 	txContext.txBuffer = prepare_tx_buffer(txContext.timeSignal, config);
 
-	% 6) Afficher le signal genere et la constellation TX.
+	% 7) Afficher le signal genere et la constellation TX.
 	visualize_tx_signal(txContext.txBuffer, txContext.symbols, config);
 end
 
@@ -121,8 +125,6 @@ end
 
 function txBuffer = prepare_tx_buffer(timeSignal, ~)
 % Normaliser le signal temporel pour eviter la saturation de l'amplificateur TX.
-% Le facteur 0.8 conserve une marge de 20% sous le plein echelle,
-% ce qui reduit le risque d'ecrerage sans trop reduire la puissance utile.
 
 	if isempty(timeSignal)
 		error('Signal temporel vide: impossible de preparer le buffer TX.');
@@ -134,10 +136,9 @@ function txBuffer = prepare_tx_buffer(timeSignal, ~)
 		return;
 	end
 
-	scale = 0.8 / peak_abs;
-	txBuffer = complex(single(timeSignal .* scale));
+	txBuffer = complex(single(timeSignal .* peak_abs));
 
-	fprintf('module_tx: buffer TX prepare (normalisation %.3f).\n', scale);
+	fprintf('module_tx: buffer TX prepare (normalisation %.3f).\n', peak_abs);
 end
 
 function preamble = build_tx_preamble(config)
@@ -237,4 +238,110 @@ function visualize_tx_signal(txBuffer, symbols, config)
 
 	fprintf('module_tx: visualisation TX affichee entre padding (%d echantillons, indices %d:%d).\n', ...
 		n_plot, idx_start, idx_end);
+end
+
+
+function [papr_db, timeSignal] = apply_papr_clipping(txContext, config)
+% Calculer le PAPR du payload OFDM et appliquer un clipping simple si
+% config.clippingRatio est defini et superieur a zero.
+% Le PAPR et le clipping portent uniquement sur la partie payload (N_SYM symboles),
+% en excluant le zero padding et le preambule.
+%
+% Champs config utilises (optionnels):
+%   config.clippingRatio : ratio CR = A / RMS. 0 ou absent = pas de clipping.
+
+	timeSignal   = txContext.timeSignal;
+	pad_len      = numel(txContext.zeroPad);
+	preamble_len = numel(txContext.preamble);
+	N_OFDM       = double(config.N_FFT) + double(config.N_CP);
+	payload_len  = double(config.N_SYM) * N_OFDM;
+
+	p_start = pad_len + preamble_len + 1;
+	payload = timeSignal(p_start : p_start + payload_len - 1);
+
+	papr_db = compute_papr(payload);
+	fprintf('module_tx: PAPR du payload = %.2f dB.\n', papr_db);
+
+	payload_before = payload;
+	payload_after = payload;
+	A = NaN;
+
+	if isfield(config, 'clippingRatio') && config.clippingRatio > 0
+		payload_after = clip_signal(payload, config.clippingRatio);
+		timeSignal(p_start : p_start + payload_len - 1) = payload_after;
+		A = config.clippingRatio * sqrt(mean(abs(payload_before).^2));
+		papr_after = compute_papr(payload_after);
+		fprintf('module_tx: PAPR apres clipping = %.2f dB (reduction: %.2f dB).\n', ...
+			papr_after, papr_db - papr_after);
+	end
+
+	visualize_clipping_effect(payload_before, payload_after, config, A);
+end
+
+
+function papr_db = compute_papr(signal)
+% Calculer le PAPR (Peak-to-Average Power Ratio) d'un signal complexe.
+%   PAPR = max(|x|^2) / mean(|x|^2), exprime en dB.
+
+	peak_pow = max(abs(signal).^2);
+	avg_pow  = mean(abs(signal).^2);
+	if avg_pow <= 0
+		papr_db = 0;
+		return;
+	end
+	papr_db = 10 * log10(peak_pow / avg_pow);
+end
+
+
+function x_clipped = clip_signal(signal, CR)
+% Appliquer un ecrerage (clipping) au signal: limiter l'amplitude a A = CR * RMS.
+% Les echantillons dont |x| > A sont ramenes a A en preservant leur phase:
+%   x_clip = x           si |x| <= A
+%   x_clip = A * x/|x|   si |x| >  A
+
+	A = CR * sqrt(mean(abs(signal).^2));
+	x_clipped = signal;
+	idx = abs(signal) > A;
+	x_clipped(idx) = A * signal(idx) ./ abs(signal(idx));
+	fprintf('module_tx: clipping applique (CR=%.2f, A=%.4f, %d/%d echantillons ecretes).\n', ...
+		CR, A, sum(idx), numel(signal));
+end
+
+
+function visualize_clipping_effect(payload_before, payload_after, config, A)
+% Visualiser simplement le signal OFDM avant/apres clipping.
+% La figure est toujours affichee (meme si clipping desactive).
+
+	N_FFT  = double(config.N_FFT);
+	N_CP   = double(config.N_CP);
+	N_OFDM = N_FFT + N_CP;
+
+	if numel(payload_before) < N_OFDM || numel(payload_after) < N_OFDM
+		return;
+	end
+
+	sym_before = payload_before(1:N_OFDM);
+	sym_after  = payload_after(1:N_OFDM);
+
+	sym_before_no_cp = sym_before(N_CP + 1:end);
+	sym_after_no_cp  = sym_after(N_CP + 1:end);
+	n = 0:(numel(sym_before_no_cp) - 1);
+
+	figure('Name', 'Clipping Avant/Apres', 'NumberTitle', 'off');
+	plot(n, abs(sym_before_no_cp), 'b', 'LineWidth', 1.0); hold on;
+	plot(n, abs(sym_after_no_cp), 'r', 'LineWidth', 1.0);
+	if ~isnan(A)
+		yline(A, '--k', sprintf('Seuil A=%.3f', A));
+	end
+	grid on;
+	xlabel('Indice echantillon (1er symbole, sans CP)');
+	ylabel('|x[n]|');
+	if ~isnan(A)
+		title('Enveloppe: avant vs apres clipping');
+		legend('Avant clipping', 'Apres clipping', 'Seuil clipping', 'Location', 'best');
+	else
+		title('Enveloppe: clipping desactive (avant = apres)');
+		legend('Avant', 'Apres', 'Location', 'best');
+	end
+	drawnow;
 end
