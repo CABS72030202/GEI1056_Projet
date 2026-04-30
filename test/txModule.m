@@ -130,7 +130,7 @@ end
 %% ============================================================
 %  ENVOIE BLADE RF
 %% ============================================================
-N_REP = 20;   % nombre de répétitions de la trame
+N_REP = 500;   % nombre de répétitions de la trame
 
 txStream = repmat(txBuffer(:), N_REP, 1);
 
@@ -146,7 +146,7 @@ fprintf('TX: duree approx totale = %.3f ms.\n', 1000 * tx_stream_len / sampleRat
 b.tx.start();
 
 fprintf('TX: transmission repetee en cours...\n');
-b.transmit(double(txStream(:)), streamTimeoutMs);
+b.transmit(double(txStream(:)), 0);
 fprintf('TX: transmission terminee.\n');
 
 b.tx.stop();
